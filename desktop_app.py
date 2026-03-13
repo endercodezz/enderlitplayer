@@ -4,7 +4,20 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QSize, QUrl, QSettings, QEvent, QRectF, QPointF
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+    Signal,
+    QObject,
+    QSize,
+    QUrl,
+    QSettings,
+    QEvent,
+    QRectF,
+    QPointF,
+    Property,
+    QPropertyAnimation,
+)
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -24,6 +37,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QStackedWidget,
     QHeaderView,
+    QStyledItemDelegate,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -133,12 +148,201 @@ class ClickSlider(QSlider):
         super().mousePressEvent(event)
 
 
+class AlbumListWidget(QListWidget):
+    playAlbumRequested = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._overlay_opacity = 0.0
+        self._overlay_target = 0.0
+        self._hovered_row: Optional[int] = None
+        self._overlay_anim = QPropertyAnimation(self, b"overlayOpacity")
+        self._overlay_anim.setDuration(140)
+        self._overlay_anim.valueChanged.connect(lambda _value: self.viewport().update())
+        self._overlay_anim.finished.connect(self._on_overlay_anim_finished)
+
+    def _on_overlay_anim_finished(self) -> None:
+        if self._overlay_target == 0.0 and self._overlay_opacity <= 0.01:
+            self._hovered_row = None
+            self.viewport().update()
+
+    def overlayOpacity(self) -> float:
+        return self._overlay_opacity
+
+    def setOverlayOpacity(self, value: float) -> None:
+        self._overlay_opacity = max(0.0, min(1.0, float(value)))
+        self.viewport().update()
+
+    overlayOpacity = Property(float, overlayOpacity, setOverlayOpacity)
+
+    def _animate_overlay(self, target: float) -> None:
+        if self._overlay_target == target and self._overlay_anim.state() == QPropertyAnimation.Running:
+            return
+        self._overlay_target = target
+        self._overlay_anim.stop()
+        self._overlay_anim.setStartValue(self._overlay_opacity)
+        self._overlay_anim.setEndValue(target)
+        self._overlay_anim.start()
+
+    def icon_rect_for_item_rect(self, item_rect) -> QRectF:
+        icon_size = self.iconSize()
+        top_pad = max(6, int(icon_size.height() * 0.08))
+        x = item_rect.x() + (item_rect.width() - icon_size.width()) // 2
+        y = item_rect.y() + top_pad
+        return QRectF(x, y, icon_size.width(), icon_size.height())
+
+    def overlay_rect_for_item_rect(self, item_rect) -> QRectF:
+        icon_rect = self.icon_rect_for_item_rect(item_rect)
+        size = max(24, int(icon_rect.width() * 0.28))
+        margin = max(6, int(icon_rect.width() * 0.08))
+        return QRectF(
+            icon_rect.right() - size - margin,
+            icon_rect.bottom() - size - margin,
+            size,
+            size,
+        )
+
+    def mousePressEvent(self, event) -> None:
+        item = self.itemAt(event.pos())
+        if item:
+            overlay_rect = self.overlay_rect_for_item_rect(self.visualItemRect(item))
+            if overlay_rect.contains(event.pos()):
+                album_id = item.data(Qt.UserRole)
+                if album_id:
+                    self.playAlbumRequested.emit(album_id)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        item = self.itemAt(event.pos())
+        row = self.row(item) if item else None
+        if row is not None and row != -1:
+            if row != self._hovered_row:
+                self._hovered_row = row
+            self._animate_overlay(1.0)
+        else:
+            if self._hovered_row is not None:
+                self._animate_overlay(0.0)
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._hovered_row is not None:
+            self._animate_overlay(0.0)
+        super().leaveEvent(event)
+
+
+class AlbumItemDelegate(QStyledItemDelegate):
+    def __init__(self, list_widget: AlbumListWidget) -> None:
+        super().__init__(list_widget)
+        self.list_widget = list_widget
+
+    def paint(self, painter, option, index) -> None:
+        super().paint(painter, option, index)
+        if self.list_widget._hovered_row == index.row() and self.list_widget.overlayOpacity > 0:
+            overlay_rect = self.list_widget.overlay_rect_for_item_rect(option.rect)
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            accent = QColor("#1db954")
+            accent.setAlphaF(self.list_widget.overlayOpacity)
+            painter.setBrush(accent)
+            painter.drawEllipse(overlay_rect)
+
+            size = min(overlay_rect.width(), overlay_rect.height())
+            tri = QPolygonF(
+                [
+                    QPointF(overlay_rect.x() + size * 0.42, overlay_rect.y() + size * 0.3),
+                    QPointF(overlay_rect.x() + size * 0.42, overlay_rect.y() + size * 0.7),
+                    QPointF(overlay_rect.x() + size * 0.72, overlay_rect.y() + size * 0.5),
+                ]
+            )
+            tri_color = QColor("#0f0f0f")
+            tri_color.setAlphaF(self.list_widget.overlayOpacity)
+            painter.setBrush(tri_color)
+            painter.drawPolygon(tri)
+            painter.restore()
+
+
 class TrackTable(QTableWidget):
     orderChanged = Signal()
+    playRequested = Signal(int)
+
+    def __init__(self, rows=0, columns=0, parent=None) -> None:
+        super().__init__(rows, columns, parent)
+        self.hover_row = -1
+        self.setMouseTracking(True)
 
     def dropEvent(self, event) -> None:
         super().dropEvent(event)
         self.orderChanged.emit()
+
+    def play_icon_rect(self, row: int) -> QRectF:
+        index = self.model().index(row, 0)
+        rect = self.visualRect(index)
+        size = min(rect.height() - 8, rect.width() - 8, 18)
+        size = max(10, size)
+        center = rect.center()
+        return QRectF(center.x() - size / 2, center.y() - size / 2, size, size)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            pos = event.position()
+            row = self.rowAt(int(pos.y()))
+            col = self.columnAt(int(pos.x()))
+            if row >= 0 and col == 0 and row == self.hover_row:
+                icon_rect = self.play_icon_rect(row)
+                if icon_rect.contains(pos):
+                    self.playRequested.emit(row)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        row = self.rowAt(int(event.position().y()))
+        if row != self.hover_row:
+            self.hover_row = row
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self.hover_row != -1:
+            self.hover_row = -1
+            self.viewport().update()
+        super().leaveEvent(event)
+
+
+class TrackNumberDelegate(QStyledItemDelegate):
+    def __init__(self, table: TrackTable) -> None:
+        super().__init__(table)
+        self.table = table
+
+    def paint(self, painter, option, index) -> None:
+        if index.column() == 0 and self.table.hover_row == index.row():
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            size = min(option.rect.height() - 8, option.rect.width() - 8, 18)
+            center = option.rect.center()
+            rect = QRectF(
+                center.x() - size / 2,
+                center.y() - size / 2,
+                size,
+                size,
+            )
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#1db954"))
+            tri = QPolygonF(
+                [
+                    QPointF(rect.x() + size * 0.25, rect.y() + size * 0.2),
+                    QPointF(rect.x() + size * 0.25, rect.y() + size * 0.8),
+                    QPointF(rect.x() + size * 0.75, rect.y() + size * 0.5),
+                ]
+            )
+            painter.drawPolygon(tri)
+            painter.restore()
+            return
+        super().paint(painter, option, index)
 
 
 TRANSLATIONS = {
@@ -511,7 +715,7 @@ class PlayerWindow(QMainWindow):
         library_layout.addWidget(self.album_count)
         library_layout.addWidget(self.album_search)
 
-        self.album_list = QListWidget()
+        self.album_list = AlbumListWidget()
         self.album_list.setObjectName("AlbumList")
         self.album_list.setViewMode(QListWidget.IconMode)
         self.album_list.setFlow(QListWidget.LeftToRight)
@@ -520,6 +724,7 @@ class PlayerWindow(QMainWindow):
         self.album_list.setIconSize(QSize(140, 140))
         self.album_list.setGridSize(QSize(190, 230))
         self.album_list.setSpacing(14)
+        self.album_list.setItemDelegate(AlbumItemDelegate(self.album_list))
         library_layout.addWidget(self.album_list, 1)
 
         detail_view = QWidget()
@@ -575,7 +780,8 @@ class PlayerWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.track_table.setShowGrid(False)
-        self.track_table.setAlternatingRowColors(True)
+        self.track_table.setAlternatingRowColors(False)
+        self.track_table.setItemDelegateForColumn(0, TrackNumberDelegate(self.track_table))
         self.track_table.setDragEnabled(True)
         self.track_table.setAcceptDrops(True)
         self.track_table.setDropIndicatorShown(True)
@@ -687,7 +893,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.1.1")
+        self.version_label = QLabel("ver 0.1.3")
         self.version_label.setObjectName("SubBrand")
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
@@ -818,8 +1024,8 @@ class PlayerWindow(QMainWindow):
             QTableWidget::item {
               padding: 6px;
             }
-            QTableWidget::item:alternate {
-              background: #161616;
+            #TrackTable::item:hover {
+              background: #1a1a1a;
             }
             #TrackTable::item:selected {
               background: #1f1f1f;
@@ -861,11 +1067,13 @@ class PlayerWindow(QMainWindow):
         self.lang_select.currentIndexChanged.connect(self.on_language_changed)
         self.album_list.itemSelectionChanged.connect(self.on_album_selected)
         self.album_list.itemClicked.connect(self.on_album_clicked)
+        self.album_list.playAlbumRequested.connect(self.on_album_quick_play)
         self.album_search.textChanged.connect(self.filter_albums)
         self.track_search.textChanged.connect(self.filter_tracks)
         self.track_table.cellDoubleClicked.connect(self.play_selected_track)
         self.track_table.itemSelectionChanged.connect(self.on_track_selected)
         self.track_table.orderChanged.connect(self.on_track_order_changed)
+        self.track_table.playRequested.connect(self.on_track_quick_play)
         self.play_button.clicked.connect(self.toggle_play)
         self.next_button.clicked.connect(self.play_next)
         self.prev_button.clicked.connect(self.play_prev)
@@ -1038,6 +1246,12 @@ class PlayerWindow(QMainWindow):
     def on_album_clicked(self, _item: QListWidgetItem) -> None:
         self.on_album_selected()
 
+    def on_album_quick_play(self, album_id: str) -> None:
+        album = next((a for a in self.albums if a.id == album_id), None)
+        if not album or not album.tracks:
+            return
+        self.start_track(album.tracks[0], album)
+
     def populate_tracks(self) -> None:
         self.track_table.setRowCount(0)
         if not self.current_album:
@@ -1135,6 +1349,10 @@ class PlayerWindow(QMainWindow):
         if not track:
             return
         self.start_track(track, self.current_album)
+
+    def on_track_quick_play(self, row: int) -> None:
+        self.track_table.selectRow(row)
+        self.play_selected_track(row, 0)
 
     def start_track(self, track: Track, album: Optional[Album] = None) -> None:
         self.current_track = track
