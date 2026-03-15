@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import time
+import math
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,6 +19,7 @@ from PySide6.QtCore import (
     QPointF,
     Property,
     QPropertyAnimation,
+    QTimer,
 )
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -44,6 +47,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QFileDialog,
+    QGraphicsOpacityEffect,
 )
 
 from mutagen import File as MutagenFile
@@ -272,11 +276,55 @@ class TrackTable(QTableWidget):
     def __init__(self, rows=0, columns=0, parent=None) -> None:
         super().__init__(rows, columns, parent)
         self.hover_row = -1
+        self.playing_track_id: Optional[str] = None
+        self.playing_active = False
+        self._play_phase = 0.0
+        self._play_anim = QPropertyAnimation(self, b"playPhase")
+        self._play_anim.setDuration(2800)
+        self._play_anim.setStartValue(0.0)
+        self._play_anim.setEndValue(1.0)
+        self._play_anim.setLoopCount(-1)
         self.setMouseTracking(True)
 
     def dropEvent(self, event) -> None:
         super().dropEvent(event)
         self.orderChanged.emit()
+
+    def set_playing_track(self, track_id: Optional[str]) -> None:
+        self.playing_track_id = track_id
+        self._update_play_anim_state()
+        self.viewport().update()
+
+    def set_playing_active(self, active: bool) -> None:
+        self.playing_active = active
+        self._update_play_anim_state()
+
+    def _update_play_anim_state(self) -> None:
+        if self.playing_track_id and self.playing_active:
+            if self._play_anim.state() != QPropertyAnimation.Running:
+                self._play_anim.start()
+        else:
+            self._play_anim.stop()
+
+    def playPhase(self) -> float:
+        return self._play_phase
+
+    def setPlayPhase(self, value: float) -> None:
+        self._play_phase = max(0.0, min(1.0, float(value)))
+        if self.playing_track_id and self.playing_active:
+            self.viewport().update()
+
+    playPhase = Property(float, playPhase, setPlayPhase)
+
+    def current_bar_pattern(self) -> tuple[float, float, float]:
+        phase = self._play_phase * 2 * math.pi
+        def wave(offset: float) -> float:
+            return 0.35 + 0.35 * 0.5 * (1 + math.sin(phase + offset))
+        return (
+            wave(0.0),
+            wave(2 * math.pi / 3),
+            wave(4 * math.pi / 3),
+        )
 
     def play_icon_rect(self, row: int) -> QRectF:
         index = self.model().index(row, 0)
@@ -319,9 +367,7 @@ class TrackNumberDelegate(QStyledItemDelegate):
         self.table = table
 
     def paint(self, painter, option, index) -> None:
-        if index.column() == 0 and self.table.hover_row == index.row():
-            painter.save()
-            painter.setRenderHint(QPainter.Antialiasing)
+        if index.column() == 0:
             size = min(option.rect.height() - 8, option.rect.width() - 8, 18)
             center = option.rect.center()
             rect = QRectF(
@@ -330,18 +376,39 @@ class TrackNumberDelegate(QStyledItemDelegate):
                 size,
                 size,
             )
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#1db954"))
-            tri = QPolygonF(
-                [
-                    QPointF(rect.x() + size * 0.25, rect.y() + size * 0.2),
-                    QPointF(rect.x() + size * 0.25, rect.y() + size * 0.8),
-                    QPointF(rect.x() + size * 0.75, rect.y() + size * 0.5),
-                ]
-            )
-            painter.drawPolygon(tri)
-            painter.restore()
-            return
+            track_id = index.data(Qt.UserRole)
+            if self.table.hover_row == index.row():
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#1db954"))
+                tri = QPolygonF(
+                    [
+                        QPointF(rect.x() + size * 0.25, rect.y() + size * 0.2),
+                        QPointF(rect.x() + size * 0.25, rect.y() + size * 0.8),
+                        QPointF(rect.x() + size * 0.75, rect.y() + size * 0.5),
+                    ]
+                )
+                painter.drawPolygon(tri)
+                painter.restore()
+                return
+            if track_id and track_id == self.table.playing_track_id:
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setPen(Qt.NoPen)
+                color = QColor("#1db954")
+                painter.setBrush(color)
+                bar_w = max(2, size * 0.2)
+                gap = max(2, size * 0.1)
+                base = rect.y() + size * 0.8
+                h1, h2, h3 = self.table.current_bar_pattern()
+                heights = [size * h1, size * h2, size * h3]
+                x = rect.x() + (size - (bar_w * 3 + gap * 2)) / 2
+                for h in heights:
+                    painter.drawRoundedRect(QRectF(x, base - h, bar_w, h), 1.2, 1.2)
+                    x += bar_w + gap
+                painter.restore()
+                return
         super().paint(painter, option, index)
 
 
@@ -462,11 +529,22 @@ class PlayerWindow(QMainWindow):
         self.track_order_map = self._load_track_orders()
         self.language = self.settings.value("language", "ru", type=str)
         self.volume_value = self._load_volume()
+        self._last_track_path = self.settings.value("last_track_path", "", type=str)
+        self._last_position_ms = max(0, self._load_int("last_position", 0))
+        self._last_playing = self._load_bool("last_playing", False)
+        self._restore_pending = False
+        self._restore_position_ms = 0
+        self._restore_autoplay = False
+        self._save_state_timer = QTimer(self)
+        self._save_state_timer.setSingleShot(True)
+        self._save_state_timer.timeout.connect(self._save_playback_state)
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
         self.audio_output.setVolume(self.volume_value / 100.0)
+
+        self._nav_last = {"back": 0.0, "forward": 0.0}
 
         self._build_ui()
         self._apply_style()
@@ -504,6 +582,23 @@ class PlayerWindow(QMainWindow):
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
+
+    def _load_bool(self, key: str, default: bool = False) -> bool:
+        raw = self.settings.value(key, default)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return default
+
+    def _load_int(self, key: str, default: int = 0) -> int:
+        raw = self.settings.value(key, default)
+        try:
+            return int(float(raw))
+        except Exception:
+            return default
 
     def _load_volume(self) -> int:
         raw = self.settings.value("volume", 80)
@@ -893,7 +988,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.1.3")
+        self.version_label = QLabel("ver 0.2.2")
         self.version_label.setObjectName("SubBrand")
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
@@ -1066,7 +1161,6 @@ class PlayerWindow(QMainWindow):
         self.browse_button.clicked.connect(self.choose_folder)
         self.lang_select.currentIndexChanged.connect(self.on_language_changed)
         self.album_list.itemSelectionChanged.connect(self.on_album_selected)
-        self.album_list.itemClicked.connect(self.on_album_clicked)
         self.album_list.playAlbumRequested.connect(self.on_album_quick_play)
         self.album_search.textChanged.connect(self.filter_albums)
         self.track_search.textChanged.connect(self.filter_tracks)
@@ -1108,13 +1202,14 @@ class PlayerWindow(QMainWindow):
         self.update_detail_cover_size()
 
     def eventFilter(self, _obj, event) -> bool:
-        if event.type() == QEvent.MouseButtonPress:
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
             if event.button() == Qt.BackButton:
-                self.show_library_view()
+                if self._nav_debounced("back"):
+                    self._handle_back_nav()
                 return True
             if event.button() == Qt.ForwardButton:
-                if self.current_album:
-                    self.show_album_view()
+                if self._nav_debounced("forward"):
+                    self._handle_forward_nav()
                 return True
         if event.type() == QEvent.KeyPress:
             if isinstance(self.focusWidget(), QLineEdit):
@@ -1122,6 +1217,36 @@ class PlayerWindow(QMainWindow):
             if event.key() == Qt.Key_Space:
                 self.toggle_play()
                 return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if self.library_stack.currentIndex() == 0:
+                    if self.album_list.currentItem():
+                        self.on_album_selected()
+                        self.show_album_view()
+                        return True
+                else:
+                    row = self.track_table.currentRow()
+                    if row >= 0:
+                        self.play_selected_track(row, 0)
+                        return True
+            if event.key() == Qt.Key_Backspace:
+                self.show_library_view()
+                return True
+            if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_F:
+                if self.library_stack.currentIndex() == 0:
+                    self.search_input.setFocus()
+                    self.search_input.selectAll()
+                else:
+                    self.track_search.setFocus()
+                    self.track_search.selectAll()
+                return True
+            if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_L:
+                self.path_input.setFocus()
+                self.path_input.selectAll()
+                return True
+            if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_S:
+                if self.library_stack.currentIndex() == 1 and self.selected_track:
+                    self.save_track_edits()
+                    return True
             if event.key() == Qt.Key_Escape:
                 self.show_library_view()
                 return True
@@ -1132,6 +1257,22 @@ class PlayerWindow(QMainWindow):
                 self.play_next()
                 return True
         return False
+
+    def _nav_debounced(self, key: str, threshold: float = 0.25) -> bool:
+        now = time.monotonic()
+        last = self._nav_last.get(key, 0.0)
+        if now - last < threshold:
+            return False
+        self._nav_last[key] = now
+        return True
+
+    def _handle_back_nav(self) -> None:
+        if self.library_stack.currentIndex() == 1:
+            self.show_library_view()
+
+    def _handle_forward_nav(self) -> None:
+        if self.library_stack.currentIndex() == 0 and self.current_album:
+            self.show_album_view()
 
     def show_loading(self, show: bool) -> None:
         self.loading_overlay.setVisible(show)
@@ -1178,6 +1319,7 @@ class PlayerWindow(QMainWindow):
         self.populate_albums()
         if self.albums:
             self.show_library_view()
+            self.restore_last_playback()
         else:
             self.library_stack.setCurrentIndex(0)
 
@@ -1229,10 +1371,10 @@ class PlayerWindow(QMainWindow):
         return build_placeholder(album.title, size)
 
     def on_album_selected(self) -> None:
-        selected = self.album_list.currentItem()
-        if not selected:
+        selected_items = self.album_list.selectedItems()
+        if not selected_items:
             return
-        album_id = selected.data(Qt.UserRole)
+        album_id = selected_items[0].data(Qt.UserRole)
         self.current_album = next((a for a in self.albums if a.id == album_id), None)
         if not self.current_album:
             return
@@ -1280,6 +1422,10 @@ class PlayerWindow(QMainWindow):
             self.track_table.setItem(row, 1, title_item)
             self.track_table.setItem(row, 2, artist_item)
             self.track_table.setItem(row, 3, length_item)
+        if self.current_album and self.current_track and self.playing_album == self.current_album:
+            self.track_table.set_playing_track(self.current_track.id)
+        else:
+            self.track_table.set_playing_track(None)
         self.on_track_selected()
 
     def on_track_order_changed(self) -> None:
@@ -1359,11 +1505,16 @@ class PlayerWindow(QMainWindow):
         self.playing_album = album or self.current_album
         self.player.setSource(QUrl.fromLocalFile(track.path))
         self.player.play()
+        self._restore_pending = False
+        self._last_position_ms = 0
         self.set_play_state(True)
         self.now_title.setText(track.title)
         self.now_artist.setText(track.artist)
         self.populate_tracks()
+        if self.current_album and self.playing_album == self.current_album:
+            self.track_table.set_playing_track(track.id)
         self.update_now_playing_cover()
+        self._schedule_playback_save(immediate=True)
 
     def toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -1372,6 +1523,7 @@ class PlayerWindow(QMainWindow):
         else:
             self.player.play()
             self.set_play_state(True)
+        self._schedule_playback_save(immediate=True)
 
     def play_next(self) -> None:
         if not self.playing_album or not self.current_track:
@@ -1400,16 +1552,36 @@ class PlayerWindow(QMainWindow):
         self.start_track(tracks[prev_index], self.playing_album)
 
     def show_album_view(self) -> None:
-        self.library_stack.setCurrentIndex(1)
+        if self.library_stack.currentIndex() != 1:
+            self.library_stack.setCurrentIndex(1)
+            self._fade_current_view()
 
     def show_library_view(self) -> None:
-        self.library_stack.setCurrentIndex(0)
+        changed = self.library_stack.currentIndex() != 0
+        if changed:
+            self.library_stack.setCurrentIndex(0)
         self.album_list.clearSelection()
+        self.album_list.setCurrentRow(-1)
         self.selected_track = None
         self.editor_number.setText("")
         self.editor_title.setText("")
         self.editor_artist.setText("")
         self.editor_filename.setText("")
+        if changed:
+            self._fade_current_view()
+
+    def _fade_current_view(self) -> None:
+        widget = self.library_stack.currentWidget()
+        if not widget:
+            return
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(160)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
 
     def play_album(self) -> None:
         if not self.current_album or not self.current_album.tracks:
@@ -1560,6 +1732,57 @@ class PlayerWindow(QMainWindow):
         if hasattr(self, "volume_value_label"):
             self.volume_value_label.setText(f"{value}%")
 
+    def _schedule_playback_save(self, immediate: bool = False) -> None:
+        if immediate:
+            self._save_state_timer.stop()
+            self._save_playback_state()
+            return
+        if not self._save_state_timer.isActive():
+            self._save_state_timer.start(1200)
+
+    def _save_playback_state(self) -> None:
+        if not self.current_track:
+            return
+        try:
+            self.settings.setValue("last_track_path", self.current_track.path)
+            self.settings.setValue("last_position", int(self._last_position_ms))
+            self.settings.setValue(
+                "last_playing",
+                self.player.playbackState() == QMediaPlayer.PlayingState,
+            )
+        except Exception:
+            pass
+
+    def _find_track_by_path(self, path: str) -> Optional[tuple[Track, Album]]:
+        if not path:
+            return None
+        for album in self.albums:
+            for track in album.tracks:
+                if track.path == path:
+                    return track, album
+        return None
+
+    def restore_last_playback(self) -> None:
+        state = self._find_track_by_path(self._last_track_path)
+        if not state:
+            return
+        track, album = state
+        self.current_track = track
+        self.playing_album = album
+        self.now_title.setText(track.title)
+        self.now_artist.setText(track.artist)
+        self.update_now_playing_cover()
+        self.player.setSource(QUrl.fromLocalFile(track.path))
+        self._restore_position_ms = max(0, self._last_position_ms)
+        self._restore_autoplay = False
+        self._restore_pending = True
+        if self._restore_position_ms == 0 and self._restore_autoplay:
+            self.player.play()
+            self.set_play_state(True)
+        else:
+            self.player.pause()
+            self.set_play_state(False)
+
     def update_album_grid(self) -> None:
         if not self.album_list:
             return
@@ -1655,6 +1878,8 @@ class PlayerWindow(QMainWindow):
 
     def set_play_state(self, is_playing: bool) -> None:
         self.play_button.setIcon(self.icon_pause if is_playing else self.icon_play)
+        if hasattr(self, "track_table"):
+            self.track_table.set_playing_active(is_playing)
 
     def update_now_playing_cover(self) -> None:
         if not self.playing_album:
@@ -1675,6 +1900,9 @@ class PlayerWindow(QMainWindow):
         self.progress.setValue(position)
         self.progress.blockSignals(False)
         self.current_time.setText(format_time(position / 1000))
+        if self.current_track:
+            self._last_position_ms = position
+            self._schedule_playback_save()
 
     def update_duration(self, duration: int) -> None:
         self.progress.setRange(0, max(duration, 0))
@@ -1683,9 +1911,24 @@ class PlayerWindow(QMainWindow):
     def handle_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         if status == QMediaPlayer.EndOfMedia:
             self.play_next()
+            return
+        if self._restore_pending and status in (
+            QMediaPlayer.LoadedMedia,
+            QMediaPlayer.BufferedMedia,
+        ):
+            if self._restore_position_ms > 0:
+                self.player.setPosition(self._restore_position_ms)
+            if self._restore_autoplay:
+                self.player.play()
+                self.set_play_state(True)
+            else:
+                self.player.pause()
+                self.set_play_state(False)
+            self._restore_pending = False
 
     def closeEvent(self, event) -> None:
         try:
+            self._save_playback_state()
             self.settings.sync()
         except Exception:
             pass
