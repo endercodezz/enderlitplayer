@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QTimer,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF
+from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF, QLinearGradient
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
@@ -97,6 +97,23 @@ def build_placeholder(title: str, size: int) -> QPixmap:
     painter.setFont(font)
     initials = (title or "NA")[:2].upper()
     painter.drawText(pixmap.rect(), Qt.AlignCenter, initials)
+    painter.end()
+    return pixmap
+
+
+def build_mix_cover(size: int) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    gradient = QLinearGradient(0, 0, size, size)
+    gradient.setColorAt(0, QColor("#1db954"))
+    gradient.setColorAt(1, QColor("#0f0f0f"))
+    painter.fillRect(pixmap.rect(), gradient)
+    painter.setPen(QColor("#0f0f0f"))
+    font = QFont("Avenir Next", max(12, int(size * 0.22)), QFont.Bold)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, "MIX")
     painter.end()
     return pixmap
 
@@ -669,8 +686,7 @@ class PlayerWindow(QMainWindow):
         self.browse_button.setText(self.t("browse"))
         self.scan_button.setText(self.t("scan"))
         self.album_header_label.setText(self.t("albums"))
-        self.mix_button.setText(self.t("mix_button"))
-        self.mix_refresh.setText(self.t("mix_refresh"))
+        self.detail_mix_refresh.setText(self.t("mix_refresh"))
         self.album_search.setPlaceholderText(self.t("search_albums"))
         self.back_button.setText(self.t("back_to_albums"))
         self.detail_play.setText(self.t("play"))
@@ -849,14 +865,8 @@ class PlayerWindow(QMainWindow):
         header_row = QHBoxLayout()
         self.album_header_label = QLabel("Albums")
         self.album_header_label.setObjectName("PanelTitle")
-        self.mix_button = QPushButton("Random mix")
-        self.mix_button.setObjectName("GhostButton")
-        self.mix_refresh = QPushButton("Pick mix")
-        self.mix_refresh.setObjectName("GhostButton")
         header_row.addWidget(self.album_header_label)
         header_row.addStretch(1)
-        header_row.addWidget(self.mix_button)
-        header_row.addWidget(self.mix_refresh)
         header_wrap = QWidget()
         header_wrap.setLayout(header_row)
 
@@ -902,11 +912,15 @@ class PlayerWindow(QMainWindow):
         self.detail_meta.setObjectName("PanelMeta")
         self.detail_play = QPushButton("Play")
         self.detail_play.setObjectName("PrimaryButton")
+        self.detail_mix_refresh = QPushButton("Pick mix")
+        self.detail_mix_refresh.setObjectName("GhostButton")
+        self.detail_mix_refresh.setVisible(False)
 
         text_col = QVBoxLayout()
         text_col.addWidget(self.detail_title)
         text_col.addWidget(self.detail_meta)
         text_col.addWidget(self.detail_play)
+        text_col.addWidget(self.detail_mix_refresh)
         text_wrap = QWidget()
         text_wrap.setLayout(text_col)
 
@@ -1047,7 +1061,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.3.3")
+        self.version_label = QLabel("ver 0.4.0")
         self.version_label.setObjectName("SubBrand")
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
@@ -1155,6 +1169,11 @@ class PlayerWindow(QMainWindow):
               background: transparent;
               border: none;
             }
+            #TrackTable {
+              background: #131313;
+              border: 1px solid #1f1f1f;
+              border-radius: 16px;
+            }
             #AlbumList::item {
               background: transparent;
               border: 1px solid transparent;
@@ -1170,13 +1189,15 @@ class PlayerWindow(QMainWindow):
               background: #1f1f1f;
             }
             QHeaderView::section {
-              background: #151515;
+              background: #141414;
               color: #b5b5b5;
               padding: 6px;
               border: none;
+              border-bottom: 1px solid #1f1f1f;
             }
             QTableWidget::item {
-              padding: 6px;
+              padding: 10px 12px;
+              border-bottom: 1px solid #1f1f1f;
             }
             #TrackTable::item:hover {
               background: #1a1a1a;
@@ -1222,8 +1243,6 @@ class PlayerWindow(QMainWindow):
         self.album_list.itemSelectionChanged.connect(self.on_album_selected)
         self.album_list.playAlbumRequested.connect(self.on_album_quick_play)
         self.album_search.textChanged.connect(self.filter_albums)
-        self.mix_button.clicked.connect(self.show_random_mix)
-        self.mix_refresh.clicked.connect(self.refresh_random_mix)
         self.track_search.textChanged.connect(self.filter_tracks)
         self.track_table.cellDoubleClicked.connect(self.play_selected_track)
         self.track_table.itemSelectionChanged.connect(self.on_track_selected)
@@ -1236,6 +1255,7 @@ class PlayerWindow(QMainWindow):
         self.progress.sliderMoved.connect(self.seek)
         self.back_button.clicked.connect(self.show_library_view)
         self.detail_play.clicked.connect(self.play_album)
+        self.detail_mix_refresh.clicked.connect(self.refresh_random_mix)
         self.editor_save.clicked.connect(self.save_track_edits)
 
         self.player.positionChanged.connect(self.update_progress)
@@ -1404,6 +1424,17 @@ class PlayerWindow(QMainWindow):
         ]
         self.album_count.setText(self.t("found").format(count=len(filtered)))
 
+        mix_title = self.t("mix_button")
+        mix_hint = self.t("mix_hint")
+        if not query or mix_title.lower().find(query) >= 0 or mix_hint.lower().find(query) >= 0:
+            mix_item = QListWidgetItem()
+            mix_item.setText(f"{mix_title}\n{mix_hint}".strip())
+            cover_size = self.album_list.iconSize().width() or 140
+            mix_item.setIcon(QIcon(build_mix_cover(cover_size)))
+            mix_item.setData(Qt.UserRole, self.mix_album_id)
+            mix_item.setSizeHint(QSize(160, 200))
+            self.album_list.addItem(mix_item)
+
         for album in filtered:
             item = QListWidgetItem()
             item.setText(f"{album.title}\n{self.display_artist(album.artist)}".strip())
@@ -1436,6 +1467,11 @@ class PlayerWindow(QMainWindow):
         if not selected_items:
             return
         album_id = selected_items[0].data(Qt.UserRole)
+        if album_id == self.mix_album_id:
+            mix_album = self.get_random_mix_album()
+            if mix_album:
+                self.open_album(mix_album)
+            return
         album = next((a for a in self.albums if a.id == album_id), None)
         if not album:
             return
@@ -1454,8 +1490,10 @@ class PlayerWindow(QMainWindow):
         self.current_album = album
         if album.id == self.mix_album_id:
             self.detail_title.setText(self.t("mix_button"))
+            self.detail_mix_refresh.setVisible(True)
         else:
             self.detail_title.setText(album.title)
+            self.detail_mix_refresh.setVisible(False)
         self.refresh_album_metadata()
         self.track_filter = self.track_search.text().strip().lower()
         self.populate_tracks()
@@ -2037,7 +2075,7 @@ class PlayerWindow(QMainWindow):
         app_font.setPointSize(base_font)
         self.setFont(app_font)
 
-        row_height = int(30 * scale)
+        row_height = int(34 * scale)
         self.track_table.verticalHeader().setDefaultSectionSize(row_height)
 
     def set_play_state(self, is_playing: bool) -> None:
