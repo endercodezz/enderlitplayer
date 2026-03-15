@@ -1122,7 +1122,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.4.2")
+        self.version_label = QLabel("ver 0.4.3")
         self.version_label.setObjectName("SubBrand")
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
@@ -1628,6 +1628,11 @@ class PlayerWindow(QMainWindow):
         self.on_album_selected()
 
     def on_album_quick_play(self, album_id: str) -> None:
+        if album_id == self.mix_album_id:
+            mix_album = self.get_random_mix_album()
+            if mix_album and mix_album.tracks:
+                self.start_track(mix_album.tracks[0], mix_album)
+            return
         album = next((a for a in self.albums if a.id == album_id), None)
         if not album or not album.tracks:
             return
