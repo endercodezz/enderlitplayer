@@ -20,7 +20,8 @@ A modern, minimal desktop music player that scans local folders, groups albums, 
 
 ### Build .exe
 - `build.bat` or `build.ps1` (generates `icon.ico` automatically)
-- Result will be in `dist/EnderlitPlayer.exe`
+- Ready build is also available in `dist/EnderlitPlayer.exe` (you can run it right away)
+- You can still build it yourself at any time; the result will be in `dist/EnderlitPlayer.exe`
 
 ### Controls
 - Mouse side buttons: Back = Albums, Forward = Album
@@ -51,7 +52,8 @@ Open an album, select a track, edit Title / Artist / File name, then Save.
 
 ### Сборка .exe
 - `build.bat` или `build.ps1` (автоматически создаст `icon.ico`)
-- Готовый файл будет в `dist/EnderlitPlayer.exe`
+- Готовый билд также лежит в `dist/EnderlitPlayer.exe` (можно запускать сразу)
+- При желании можно собрать самостоятельно; результат будет в `dist/EnderlitPlayer.exe`
 
 ### Управление
 - Боковые кнопки мыши: Назад = Альбомы, Вперед = Альбом

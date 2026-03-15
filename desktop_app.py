@@ -21,12 +21,15 @@ from PySide6.QtCore import (
     Property,
     QPropertyAnimation,
     QTimer,
+    QEasingCurve,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF, QLinearGradient
+from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF, QLinearGradient, QPainterPath
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -116,6 +119,23 @@ def build_mix_cover(size: int) -> QPixmap:
     painter.drawText(pixmap.rect(), Qt.AlignCenter, "MIX")
     painter.end()
     return pixmap
+
+
+def rounded_pixmap(pixmap: QPixmap, radius: float) -> QPixmap:
+    if pixmap.isNull():
+        return pixmap
+    if radius <= 0:
+        return pixmap
+    rounded = QPixmap(pixmap.size())
+    rounded.fill(Qt.transparent)
+    painter = QPainter(rounded)
+    painter.setRenderHint(QPainter.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0.0, 0.0, float(pixmap.width()), float(pixmap.height())), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.end()
+    return rounded
 
 
 def build_app_icon(size: int = 256) -> QIcon:
@@ -552,6 +572,9 @@ class PlayerWindow(QMainWindow):
         self.settings = QSettings("EnderLit", "EnderLitPlayer")
         self.track_order_map = self._load_track_orders()
         self.language = self.settings.value("language", "ru", type=str)
+        self.cover_style = self.settings.value("cover_style", "rounded", type=str)
+        if self.cover_style not in {"rounded", "square"}:
+            self.cover_style = "rounded"
         self.volume_value = self._load_volume()
         self._last_track_path = self.settings.value("last_track_path", "", type=str)
         self._last_position_ms = max(0, self._load_int("last_position", 0))
@@ -569,11 +592,15 @@ class PlayerWindow(QMainWindow):
         self.audio_output.setVolume(self.volume_value / 100.0)
 
         self._nav_last = {"back": 0.0, "forward": 0.0}
+        self._transport_buttons: tuple[QPushButton, ...] = tuple()
+        self._transport_button_effects: dict[QPushButton, QGraphicsOpacityEffect] = {}
+        self._transport_button_anims: dict[QPushButton, QPropertyAnimation] = {}
         self.mix_album_id = "mix_random"
         self.mix_track_paths, self.mix_updated_at = self._load_mix_state()
 
         self._build_ui()
         self._apply_style()
+        self._apply_cover_label_style()
         self._connect_signals()
         self._load_default_path()
         self.update_now_playing_cover()
@@ -582,7 +609,7 @@ class PlayerWindow(QMainWindow):
 
         self.search_input.setMinimumWidth(160)
         self.path_input.setMinimumWidth(200)
-        self.lang_select.setMinimumWidth(90)
+        self.settings_button.setMinimumWidth(110)
 
         app = QApplication.instance()
         if app:
@@ -683,6 +710,7 @@ class PlayerWindow(QMainWindow):
         self.brand_label.setText(self.t("my_library"))
         self.search_input.setPlaceholderText(self.t("search_library"))
         self.path_input.setPlaceholderText(self.t("choose_folder"))
+        self.settings_button.setText("Settings" if self.language == "en" else "Настройки")
         self.browse_button.setText(self.t("browse"))
         self.scan_button.setText(self.t("scan"))
         self.album_header_label.setText(self.t("albums"))
@@ -739,15 +767,13 @@ class PlayerWindow(QMainWindow):
         self.scan_button.setObjectName("PrimaryButton")
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search in library")
-        self.lang_select = QComboBox()
-        self.lang_select.addItem("English", "en")
-        self.lang_select.addItem("Русский", "ru")
-        self.lang_select.setCurrentIndex(0 if self.language == "en" else 1)
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.setObjectName("GhostButton")
 
         self.top_layout.addWidget(self.brand_label, 1)
         self.top_layout.addWidget(self.search_input, 3)
         self.top_layout.addWidget(self.path_input, 3)
-        self.top_layout.addWidget(self.lang_select, 1)
+        self.top_layout.addWidget(self.settings_button, 1)
         self.top_layout.addWidget(self.browse_button, 1)
         self.top_layout.addWidget(self.scan_button, 1)
 
@@ -795,6 +821,40 @@ class PlayerWindow(QMainWindow):
         self.next_button.setIcon(self.icon_next)
         self.next_button.setIconSize(QSize(icon_size, icon_size))
         self.next_button.setText("")
+
+    def _setup_transport_button_animations(self) -> None:
+        self._transport_buttons = (self.prev_button, self.play_button, self.next_button)
+        self._transport_button_effects = {}
+        self._transport_button_anims = {}
+        for button in self._transport_buttons:
+            effect = QGraphicsOpacityEffect(button)
+            effect.setOpacity(0.9)
+            button.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", button)
+            anim.setDuration(140)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            self._transport_button_effects[button] = effect
+            self._transport_button_anims[button] = anim
+            button.installEventFilter(self)
+            button.pressed.connect(lambda b=button: self._animate_transport_button(b, 0.72, 90))
+            button.released.connect(
+                lambda b=button: self._animate_transport_button(
+                    b,
+                    1.0 if b.underMouse() else 0.9,
+                    120,
+                )
+            )
+
+    def _animate_transport_button(self, button: QPushButton, target_opacity: float, duration: int = 140) -> None:
+        effect = self._transport_button_effects.get(button)
+        anim = self._transport_button_anims.get(button)
+        if not effect or not anim:
+            return
+        anim.stop()
+        anim.setDuration(duration)
+        anim.setStartValue(effect.opacity())
+        anim.setEndValue(max(0.55, min(1.0, float(target_opacity))))
+        anim.start()
 
     def _make_icon(self, kind: str, size: int, color: str) -> QIcon:
         pixmap = QPixmap(size, size)
@@ -1024,6 +1084,7 @@ class PlayerWindow(QMainWindow):
         self.play_button.setObjectName("PrimaryButton")
         self.next_button = QPushButton()
         self._init_player_icons()
+        self._setup_transport_button_animations()
         control_row.addWidget(self.prev_button)
         control_row.addWidget(self.play_button)
         control_row.addWidget(self.next_button)
@@ -1061,7 +1122,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.4.0")
+        self.version_label = QLabel("ver 0.4.2")
         self.version_label.setObjectName("SubBrand")
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
@@ -1207,11 +1268,11 @@ class PlayerWindow(QMainWindow):
             }
             #CoverLabel {
               background: #1a1a1a;
-              border-radius: 12px;
+              border-radius: 10px;
             }
             #DetailCover {
               background: #1a1a1a;
-              border-radius: 18px;
+              border-radius: 14px;
             }
             #EditorFrame {
               background: #111111;
@@ -1219,15 +1280,16 @@ class PlayerWindow(QMainWindow):
               border: 1px solid #1f1f1f;
             }
             QSlider::groove:horizontal {
-              height: 6px;
+              height: 5px;
               background: #2a2a2a;
               border-radius: 999px;
             }
             QSlider::handle:horizontal {
-              width: 16px;
+              width: 14px;
               background: #1db954;
-              border-radius: 8px;
-              margin: -6px 0;
+              border: 1px solid #0f0f0f;
+              border-radius: 7px;
+              margin: -5px 0;
             }
             #LoadingOverlay {
               background: rgba(10, 10, 10, 220);
@@ -1239,7 +1301,7 @@ class PlayerWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.scan_button.clicked.connect(self.scan_library)
         self.browse_button.clicked.connect(self.choose_folder)
-        self.lang_select.currentIndexChanged.connect(self.on_language_changed)
+        self.settings_button.clicked.connect(self.open_settings_dialog)
         self.album_list.itemSelectionChanged.connect(self.on_album_selected)
         self.album_list.playAlbumRequested.connect(self.on_album_quick_play)
         self.album_search.textChanged.connect(self.filter_albums)
@@ -1270,10 +1332,78 @@ class PlayerWindow(QMainWindow):
         if default_path:
             self.scan_library()
 
-    def on_language_changed(self) -> None:
-        self.language = self.lang_select.currentData()
+    def set_language(self, code: str) -> None:
+        if code not in {"en", "ru"}:
+            return
+        if self.language == code:
+            return
+        self.language = code
         self.settings.setValue("language", self.language)
         self.apply_language()
+
+    def set_cover_style(self, cover_style: str) -> None:
+        if cover_style not in {"rounded", "square"}:
+            return
+        if self.cover_style == cover_style:
+            return
+        self.cover_style = cover_style
+        self.settings.setValue("cover_style", self.cover_style)
+        self._apply_cover_label_style()
+        self.populate_albums(preserve_selection=True)
+        self.update_cover()
+        self.update_now_playing_cover()
+
+    def _apply_cover_label_style(self) -> None:
+        now_radius = 10 if self.cover_style == "rounded" else 2
+        detail_radius = 14 if self.cover_style == "rounded" else 2
+        self.cover_label.setStyleSheet(f"background: #1a1a1a; border-radius: {now_radius}px;")
+        self.detail_cover.setStyleSheet(f"background: #1a1a1a; border-radius: {detail_radius}px;")
+
+    def open_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings" if self.language == "en" else "Настройки")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(360)
+
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        language_combo = QComboBox(dialog)
+        language_combo.addItem("English", "en")
+        language_combo.addItem("Русский", "ru")
+        language_combo.setCurrentIndex(0 if self.language == "en" else 1)
+
+        covers_combo = QComboBox(dialog)
+        if self.language == "en":
+            covers_combo.addItem("Rounded", "rounded")
+            covers_combo.addItem("Square", "square")
+        else:
+            covers_combo.addItem("Скругленные", "rounded")
+            covers_combo.addItem("Квадратные", "square")
+        covers_combo.setCurrentIndex(0 if self.cover_style == "rounded" else 1)
+
+        form.addRow("Language" if self.language == "en" else "Язык", language_combo)
+        form.addRow("Cover style" if self.language == "en" else "Вид обложек", covers_combo)
+        layout.addLayout(form)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_button = QPushButton("Cancel" if self.language == "en" else "Отмена", dialog)
+        apply_button = QPushButton("Apply" if self.language == "en" else "Применить", dialog)
+        apply_button.setObjectName("PrimaryButton")
+        actions.addWidget(cancel_button)
+        actions.addWidget(apply_button)
+        layout.addLayout(actions)
+
+        cancel_button.clicked.connect(dialog.reject)
+        apply_button.clicked.connect(dialog.accept)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.set_language(language_combo.currentData())
+        self.set_cover_style(covers_combo.currentData())
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -1283,6 +1413,13 @@ class PlayerWindow(QMainWindow):
         self.update_detail_cover_size()
 
     def eventFilter(self, _obj, event) -> bool:
+        if _obj in self._transport_buttons:
+            if event.type() == QEvent.Enter:
+                self._animate_transport_button(_obj, 1.0, 150)
+                return False
+            if event.type() == QEvent.Leave:
+                self._animate_transport_button(_obj, 0.9, 130)
+                return False
         if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
             if event.button() == Qt.BackButton:
                 if self._nav_debounced("back"):
@@ -1430,7 +1567,7 @@ class PlayerWindow(QMainWindow):
             mix_item = QListWidgetItem()
             mix_item.setText(f"{mix_title}\n{mix_hint}".strip())
             cover_size = self.album_list.iconSize().width() or 140
-            mix_item.setIcon(QIcon(build_mix_cover(cover_size)))
+            mix_item.setIcon(QIcon(rounded_pixmap(build_mix_cover(cover_size), self._cover_radius(cover_size))))
             mix_item.setData(Qt.UserRole, self.mix_album_id)
             mix_item.setSizeHint(QSize(160, 200))
             self.album_list.addItem(mix_item)
@@ -1452,15 +1589,25 @@ class PlayerWindow(QMainWindow):
         self.album_list.blockSignals(False)
         self.update_album_grid()
 
+    def _cover_radius(self, size: int) -> float:
+        if self.cover_style == "square":
+            return 0.0
+        return max(6.0, size * 0.085)
+
     def album_pixmap(self, album: Album, size: int) -> QPixmap:
+        radius = self._cover_radius(size)
+        if album.id == self.mix_album_id:
+            return rounded_pixmap(build_mix_cover(size), radius)
+
+        source = QPixmap()
         if album.cover_bytes:
-            pixmap = QPixmap()
-            pixmap.loadFromData(album.cover_bytes)
-            return pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-        if album.cover_path and Path(album.cover_path).exists():
-            pixmap = QPixmap(album.cover_path)
-            return pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-        return build_placeholder(album.title, size)
+            source.loadFromData(album.cover_bytes)
+        if source.isNull() and album.cover_path and Path(album.cover_path).exists():
+            source = QPixmap(album.cover_path)
+        if source.isNull():
+            source = build_placeholder(album.title, size)
+        scaled = source.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        return rounded_pixmap(scaled, radius)
 
     def on_album_selected(self) -> None:
         selected_items = self.album_list.selectedItems()
@@ -1594,7 +1741,7 @@ class PlayerWindow(QMainWindow):
 
     def update_cover(self) -> None:
         if not self.current_album:
-            self.detail_cover.setPixmap(build_placeholder("NA", 160))
+            self.detail_cover.setPixmap(rounded_pixmap(build_placeholder("NA", 160), self._cover_radius(160)))
             return
         detail_size = self.detail_cover.width() or 160
         detail_pixmap = self.album_pixmap(self.current_album, max(320, detail_size))
@@ -2086,7 +2233,9 @@ class PlayerWindow(QMainWindow):
     def update_now_playing_cover(self) -> None:
         if not self.playing_album:
             size = self.cover_label.width() or 56
-            self.cover_label.setPixmap(build_placeholder("NA", size))
+            self.cover_label.setPixmap(
+                rounded_pixmap(build_placeholder("NA", size), self._cover_radius(size))
+            )
             return
         size = self.cover_label.width() or 56
         pixmap = self.album_pixmap(self.playing_album, max(128, size))
