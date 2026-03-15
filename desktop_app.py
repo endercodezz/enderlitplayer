@@ -4,8 +4,9 @@ import sys
 import time
 import math
 import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import (
     Qt,
@@ -22,13 +23,13 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QTimer,
     QEasingCurve,
+    QEventLoop,
 )
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QIcon, QPolygonF, QLinearGradient, QPainterPath
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
-    QDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -37,7 +38,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMessageBox,
     QComboBox,
     QPushButton,
     QProgressBar,
@@ -50,7 +50,6 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
-    QFileDialog,
     QGraphicsOpacityEffect,
 )
 
@@ -59,6 +58,14 @@ from mutagen import File as MutagenFile
 from library import Album, Track, default_scan_path, scan_library, make_id
 
 import json
+
+
+@dataclass
+class PlaylistData:
+    id: str
+    title: str
+    icon_path: str
+    track_paths: List[str]
 
 
 class ScanWorker(QObject):
@@ -308,14 +315,16 @@ class AlbumItemDelegate(QStyledItemDelegate):
 
 
 class TrackTable(QTableWidget):
-    orderChanged = Signal()
     playRequested = Signal(int)
+    deleteRequested = Signal(int)
 
     def __init__(self, rows=0, columns=0, parent=None) -> None:
         super().__init__(rows, columns, parent)
         self.hover_row = -1
+        self.hover_col = -1
         self.playing_track_id: Optional[str] = None
         self.playing_active = False
+        self.playlist_delete_enabled = False
         self._play_phase = 0.0
         self._play_anim = QPropertyAnimation(self, b"playPhase")
         self._play_anim.setDuration(2800)
@@ -323,10 +332,8 @@ class TrackTable(QTableWidget):
         self._play_anim.setEndValue(1.0)
         self._play_anim.setLoopCount(-1)
         self.setMouseTracking(True)
-
-    def dropEvent(self, event) -> None:
-        super().dropEvent(event)
-        self.orderChanged.emit()
+        self.setAutoScroll(True)
+        self.setAutoScrollMargin(24)
 
     def set_playing_track(self, track_id: Optional[str]) -> None:
         self.playing_track_id = track_id
@@ -336,6 +343,10 @@ class TrackTable(QTableWidget):
     def set_playing_active(self, active: bool) -> None:
         self.playing_active = active
         self._update_play_anim_state()
+
+    def set_playlist_delete_enabled(self, enabled: bool) -> None:
+        self.playlist_delete_enabled = bool(enabled)
+        self.viewport().update()
 
     def _update_play_anim_state(self) -> None:
         if self.playing_track_id and self.playing_active:
@@ -377,6 +388,12 @@ class TrackTable(QTableWidget):
             pos = event.position()
             row = self.rowAt(int(pos.y()))
             col = self.columnAt(int(pos.x()))
+            if row >= 0 and col == 4 and self.playlist_delete_enabled:
+                icon_rect = self.action_icon_rect(row)
+                if icon_rect.contains(pos):
+                    self.deleteRequested.emit(row)
+                    event.accept()
+                    return
             if row >= 0 and col == 0 and row == self.hover_row:
                 icon_rect = self.play_icon_rect(row)
                 if icon_rect.contains(pos):
@@ -387,16 +404,27 @@ class TrackTable(QTableWidget):
 
     def mouseMoveEvent(self, event) -> None:
         row = self.rowAt(int(event.position().y()))
-        if row != self.hover_row:
+        col = self.columnAt(int(event.position().x()))
+        if row != self.hover_row or col != self.hover_col:
             self.hover_row = row
+            self.hover_col = col
             self.viewport().update()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:
-        if self.hover_row != -1:
+        if self.hover_row != -1 or self.hover_col != -1:
             self.hover_row = -1
+            self.hover_col = -1
             self.viewport().update()
         super().leaveEvent(event)
+
+    def action_icon_rect(self, row: int) -> QRectF:
+        index = self.model().index(row, 4)
+        rect = self.visualRect(index)
+        size = min(rect.height() - 10, rect.width() - 10, 16)
+        size = max(10, size)
+        center = rect.center()
+        return QRectF(center.x() - size / 2, center.y() - size / 2, size, size)
 
 
 class TrackNumberDelegate(QStyledItemDelegate):
@@ -450,20 +478,97 @@ class TrackNumberDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
 
 
+class TrackActionDelegate(QStyledItemDelegate):
+    def __init__(self, table: TrackTable) -> None:
+        super().__init__(table)
+        self.table = table
+
+    def paint(self, painter, option, index) -> None:
+        if index.column() != 4 or not self.table.playlist_delete_enabled:
+            return
+        icon_rect = self.table.action_icon_rect(index.row())
+        hovered = self.table.hover_row == index.row() and self.table.hover_col == index.column()
+        theme_mode = self.table.property("theme_mode") or "dark"
+        base_color = QColor("#7a8088" if theme_mode == "light" else "#9aa0a9")
+        if hovered:
+            base_color = QColor("#ef4444")
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(base_color)
+
+        lid_h = icon_rect.height() * 0.16
+        body_w = icon_rect.width() * 0.6
+        body_h = icon_rect.height() * 0.58
+        body_x = icon_rect.center().x() - body_w / 2
+        body_y = icon_rect.y() + lid_h + icon_rect.height() * 0.16
+        painter.drawRoundedRect(QRectF(body_x, body_y, body_w, body_h), 1.2, 1.2)
+
+        top_w = icon_rect.width() * 0.82
+        top_h = max(1.0, lid_h)
+        top_x = icon_rect.center().x() - top_w / 2
+        top_y = icon_rect.y() + icon_rect.height() * 0.12
+        painter.drawRoundedRect(QRectF(top_x, top_y, top_w, top_h), 1.0, 1.0)
+
+        handle_w = icon_rect.width() * 0.28
+        handle_h = icon_rect.height() * 0.08
+        handle_x = icon_rect.center().x() - handle_w / 2
+        handle_y = top_y - handle_h * 0.35
+        painter.drawRoundedRect(QRectF(handle_x, handle_y, handle_w, handle_h), 1.0, 1.0)
+        painter.restore()
+
 TRANSLATIONS = {
     "en": {
         "app_title": "Enderlit Player",
         "my_library": "My Library",
         "search_library": "Search in library",
         "choose_folder": "Choose a music folder",
+        "folder_path": "Folder path",
+        "image_path": "Image path",
+        "settings": "Settings",
         "browse": "Browse",
         "scan": "Scan Library",
         "albums": "Albums",
+        "playlists": "Playlists",
+        "theme": "Theme",
+        "theme_dark": "Dark",
+        "theme_light": "Light",
         "mix_button": "Random mix",
         "mix_hint": "Updates on request",
         "mix_refresh": "Pick mix",
         "found": "{count} found",
         "back_to_albums": "Back to albums",
+        "edit_order": "Edit order",
+        "finish_order": "Done",
+        "move_up": "Up",
+        "move_down": "Down",
+        "search_playlists": "Search playlists",
+        "create_playlist": "Create playlist",
+        "delete_playlist": "Delete playlist",
+        "playlist_name": "Playlist name",
+        "playlist_icon": "Playlist icon",
+        "choose_icon": "Choose icon",
+        "change_icon": "Change icon",
+        "add_tracks": "Add tracks",
+        "remove_track": "Remove selected",
+        "playlist_empty": "Playlist is empty",
+        "playlist_meta": "Playlist  {tracks} tracks  {duration}",
+        "playlist_card_meta": "{count} tracks",
+        "create": "Create",
+        "cancel": "Cancel",
+        "add_selected": "Add selected",
+        "select_tracks_title": "Add tracks to playlist",
+        "no_tracks_to_add": "No tracks available. Scan your library first.",
+        "playlist_name_required": "Enter playlist name.",
+        "delete_playlist_title": "Delete playlist",
+        "delete_playlist_body": "Delete playlist \"{name}\"?",
+        "playlist_saved": "Saved",
+        "latest_version_here": "Latest version here",
+        "yes": "Yes",
+        "no": "No",
+        "ok": "OK",
+        "apply": "Apply",
         "play": "Play",
         "search_albums": "Search albums",
         "search_tracks": "Search tracks",
@@ -489,8 +594,8 @@ TRANSLATIONS = {
         "tag_update_failed_body": "Could not write metadata to this file.",
         "loading": "Scanning your library...",
         "album_meta": "{artist}  {tracks} tracks  {duration}",
-        "reorder_hint": "Drag tracks to reorder",
-        "reorder_hint_filtered": "Disable filter to reorder tracks",
+        "reorder_hint": "Change track number below and save",
+        "reorder_hint_filtered": "Clear search to edit order by number",
         "unknown_artist": "Unknown Artist",
         "various_artists": "Various Artists",
         "now_title_idle": "Nothing playing",
@@ -507,14 +612,51 @@ TRANSLATIONS = {
         "my_library": "Моя медиатека",
         "search_library": "Искать в медиатеке",
         "choose_folder": "Выберите папку с музыкой",
+        "folder_path": "Путь к папке",
+        "image_path": "Путь к изображению",
+        "settings": "Настройки",
         "browse": "Обзор",
         "scan": "Сканировать",
         "albums": "Альбомы",
+        "playlists": "Плейлисты",
+        "theme": "Тема",
+        "theme_dark": "Темная",
+        "theme_light": "Светлая",
         "mix_button": "Случайный микс",
         "mix_hint": "Обновляется по кнопке",
         "mix_refresh": "Подобрать",
         "found": "Найдено: {count}",
         "back_to_albums": "Назад к альбомам",
+        "edit_order": "Редактировать порядок",
+        "finish_order": "Готово",
+        "move_up": "Вверх",
+        "move_down": "Вниз",
+        "search_playlists": "Искать плейлисты",
+        "create_playlist": "Создать плейлист",
+        "delete_playlist": "Удалить плейлист",
+        "playlist_name": "Название плейлиста",
+        "playlist_icon": "Иконка плейлиста",
+        "choose_icon": "Выбрать иконку",
+        "change_icon": "Сменить иконку",
+        "add_tracks": "Добавить треки",
+        "remove_track": "Убрать выбранный",
+        "playlist_empty": "Плейлист пуст",
+        "playlist_meta": "Плейлист  {tracks} треков  {duration}",
+        "playlist_card_meta": "{count} треков",
+        "create": "Создать",
+        "cancel": "Отмена",
+        "add_selected": "Добавить выбранные",
+        "select_tracks_title": "Добавление треков в плейлист",
+        "no_tracks_to_add": "Нет треков для добавления. Сначала просканируйте библиотеку.",
+        "playlist_name_required": "Введите название плейлиста.",
+        "delete_playlist_title": "Удалить плейлист",
+        "delete_playlist_body": "Удалить плейлист \"{name}\"?",
+        "playlist_saved": "Сохранено",
+        "latest_version_here": "Актуальная версия тут",
+        "yes": "Да",
+        "no": "Нет",
+        "ok": "ОК",
+        "apply": "Применить",
         "play": "Слушать",
         "search_albums": "Искать альбомы",
         "search_tracks": "Искать треки",
@@ -540,8 +682,8 @@ TRANSLATIONS = {
         "tag_update_failed_body": "Не удалось записать теги.",
         "loading": "Сканируем вашу библиотеку...",
         "album_meta": "{artist}  {tracks} треков  {duration}",
-        "reorder_hint": "Перетаскивайте треки для порядка",
-        "reorder_hint_filtered": "Отключите поиск, чтобы менять порядок",
+        "reorder_hint": "Измените номер трека внизу и нажмите Сохранить",
+        "reorder_hint_filtered": "Отключите поиск, чтобы менять порядок по номеру",
         "unknown_artist": "Неизвестный исполнитель",
         "various_artists": "Разные исполнители",
         "now_title_idle": "Ничего не играет",
@@ -568,13 +710,24 @@ class PlayerWindow(QMainWindow):
         self.selected_track: Optional[Track] = None
         self.track_filter = ""
         self.playing_album: Optional[Album] = None
+        self.order_edit_mode = False
+        self.current_playlist: Optional[PlaylistData] = None
+        self.library_mode = "albums"
+        self.current_collection_kind = "album"
 
         self.settings = QSettings("EnderLit", "EnderLitPlayer")
         self.track_order_map = self._load_track_orders()
         self.language = self.settings.value("language", "ru", type=str)
+        self.library_mode = self.settings.value("library_mode", "albums", type=str)
+        if self.library_mode not in {"albums", "playlists"}:
+            self.library_mode = "albums"
+        self.theme = self.settings.value("theme", "dark", type=str)
+        if self.theme not in {"dark", "light"}:
+            self.theme = "dark"
         self.cover_style = self.settings.value("cover_style", "rounded", type=str)
         if self.cover_style not in {"rounded", "square"}:
             self.cover_style = "rounded"
+        self.playlists: List[PlaylistData] = self._load_playlists()
         self.volume_value = self._load_volume()
         self._last_track_path = self.settings.value("last_track_path", "", type=str)
         self._last_position_ms = max(0, self._load_int("last_position", 0))
@@ -694,6 +847,70 @@ class PlayerWindow(QMainWindow):
         except Exception:
             pass
 
+    def _load_playlists(self) -> List[PlaylistData]:
+        raw = self.settings.value("playlists", "")
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except Exception:
+                raw = ""
+        if isinstance(raw, list):
+            data = raw
+        else:
+            if not isinstance(raw, str):
+                raw = str(raw)
+            if not raw:
+                return []
+            try:
+                data = json.loads(raw)
+            except Exception:
+                return []
+        if not isinstance(data, list):
+            return []
+        playlists: List[PlaylistData] = []
+        seen_ids = set()
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            if not title:
+                continue
+            playlist_id = str(item.get("id") or make_id(f"playlist:{title}:{index}"))
+            if playlist_id in seen_ids:
+                playlist_id = make_id(f"{playlist_id}:{index}:{time.time_ns()}")
+            seen_ids.add(playlist_id)
+            icon_path = str(item.get("icon_path", "") or "")
+            track_paths_raw = item.get("track_paths", [])
+            if isinstance(track_paths_raw, list):
+                track_paths = [str(path) for path in track_paths_raw if path]
+            else:
+                track_paths = []
+            playlists.append(
+                PlaylistData(
+                    id=playlist_id,
+                    title=title,
+                    icon_path=icon_path,
+                    track_paths=track_paths,
+                )
+            )
+        return playlists
+
+    def _save_playlists(self) -> None:
+        payload = [
+            {
+                "id": playlist.id,
+                "title": playlist.title,
+                "icon_path": playlist.icon_path,
+                "track_paths": list(playlist.track_paths),
+            }
+            for playlist in self.playlists
+        ]
+        try:
+            self.settings.setValue("playlists", json.dumps(payload, ensure_ascii=False))
+            self.settings.sync()
+        except Exception:
+            pass
+
     def _save_track_orders(self) -> None:
         try:
             self.settings.setValue("track_orders", json.dumps(self.track_order_map))
@@ -705,19 +922,56 @@ class PlayerWindow(QMainWindow):
         bundle = TRANSLATIONS.get(self.language, TRANSLATIONS["en"])
         return bundle.get(key, key)
 
+    def _update_library_mode_ui(self) -> None:
+        albums_mode = self.library_mode == "albums"
+        self.albums_tab_button.setChecked(albums_mode)
+        self.playlists_tab_button.setChecked(not albums_mode)
+        self.create_playlist_button.setVisible(not albums_mode)
+        self.delete_playlist_button.setVisible(False)
+        self.album_header_label.setText(self.t("albums") if albums_mode else self.t("playlists"))
+        self.album_search.setPlaceholderText(
+            self.t("search_albums") if albums_mode else self.t("search_playlists")
+        )
+
+    def set_library_mode(self, mode: str, preserve_selection: bool = False) -> None:
+        if mode not in {"albums", "playlists"}:
+            return
+        if self.library_mode == mode and not preserve_selection:
+            self._update_library_mode_ui()
+            return
+        self.library_mode = mode
+        self.settings.setValue("library_mode", self.library_mode)
+        self._update_library_mode_ui()
+        if self.library_stack.currentIndex() == 1:
+            if mode == "albums" and self.current_collection_kind == "playlist":
+                self.show_library_view()
+            if mode == "playlists" and self.current_collection_kind in {"album", "mix"}:
+                self.show_library_view()
+        self.populate_albums(preserve_selection=preserve_selection)
+
     def apply_language(self) -> None:
         self.setWindowTitle(self.t("app_title"))
         self.brand_label.setText(self.t("my_library"))
         self.search_input.setPlaceholderText(self.t("search_library"))
         self.path_input.setPlaceholderText(self.t("choose_folder"))
-        self.settings_button.setText("Settings" if self.language == "en" else "Настройки")
+        self.settings_button.setText(self.t("settings"))
         self.browse_button.setText(self.t("browse"))
         self.scan_button.setText(self.t("scan"))
-        self.album_header_label.setText(self.t("albums"))
+        self.albums_tab_button.setText(self.t("albums"))
+        self.playlists_tab_button.setText(self.t("playlists"))
+        self.create_playlist_button.setText(self.t("create_playlist"))
+        self.delete_playlist_button.setText(self.t("delete_playlist"))
+        self._update_library_mode_ui()
         self.detail_mix_refresh.setText(self.t("mix_refresh"))
-        self.album_search.setPlaceholderText(self.t("search_albums"))
         self.back_button.setText(self.t("back_to_albums"))
         self.detail_play.setText(self.t("play"))
+        self.edit_order_button.setText(self.t("finish_order") if self.order_edit_mode else self.t("edit_order"))
+        self.move_up_button.setText(self.t("move_up"))
+        self.move_down_button.setText(self.t("move_down"))
+        self.detail_playlist_add.setText(self.t("add_tracks"))
+        self.detail_playlist_remove.setText(self.t("remove_track"))
+        self.detail_playlist_delete.setText(self.t("delete_playlist"))
+        self.detail_playlist_icon.setText(self.t("change_icon"))
         self.track_search.setPlaceholderText(self.t("search_tracks"))
         self.editor_title.setPlaceholderText(self.t("track_title"))
         self.editor_number.setPlaceholderText(self.t("track_number"))
@@ -725,10 +979,11 @@ class PlayerWindow(QMainWindow):
         self.editor_filename.setPlaceholderText(self.t("file_name"))
         self.editor_save.setText(self.t("save_changes"))
         self.volume_label.setText(self.t("volume"))
+        self.latest_version_label.setText(self.t("latest_version_here"))
         self._update_volume_label(self.volume.value())
         self.loading_label.setText(self.t("loading"))
         self.track_table.setHorizontalHeaderLabels(
-            [self.t("header_no"), self.t("header_title"), self.t("header_artist"), self.t("header_length")]
+            [self.t("header_no"), self.t("header_title"), self.t("header_artist"), self.t("header_length"), ""]
         )
         self.reorder_hint.setText(
             self.t("reorder_hint_filtered") if self.track_filter else self.t("reorder_hint")
@@ -742,6 +997,8 @@ class PlayerWindow(QMainWindow):
         if self.current_album:
             if self.current_album.id == self.mix_album_id:
                 self.detail_title.setText(self.t("mix_button"))
+            elif self.current_collection_kind == "playlist" and self.current_playlist:
+                self.detail_title.setText(self.current_playlist.title)
             self.refresh_album_metadata()
 
     def _build_ui(self) -> None:
@@ -804,11 +1061,41 @@ class PlayerWindow(QMainWindow):
         overlay_layout.addWidget(self.loading_bar)
         overlay_layout.addWidget(self.loading_label)
 
+        self.modal_overlay = QFrame(root)
+        self.modal_overlay.setObjectName("ModalOverlay")
+        self.modal_overlay.hide()
+        modal_overlay_layout = QVBoxLayout(self.modal_overlay)
+        modal_overlay_layout.setContentsMargins(28, 28, 28, 28)
+        modal_overlay_layout.setAlignment(Qt.AlignCenter)
+
+        self.modal_card = QFrame(self.modal_overlay)
+        self.modal_card.setObjectName("ModalCard")
+        modal_card_layout = QVBoxLayout(self.modal_card)
+        modal_card_layout.setContentsMargins(18, 16, 18, 16)
+        modal_card_layout.setSpacing(12)
+
+        self.modal_title = QLabel("")
+        self.modal_title.setObjectName("DetailTitle")
+        self.modal_body_host = QWidget(self.modal_card)
+        self.modal_body_layout = QVBoxLayout(self.modal_body_host)
+        self.modal_body_layout.setContentsMargins(0, 0, 0, 0)
+        self.modal_body_layout.setSpacing(10)
+        self.modal_actions_host = QWidget(self.modal_card)
+        self.modal_actions_layout = QHBoxLayout(self.modal_actions_host)
+        self.modal_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.modal_actions_layout.setSpacing(8)
+
+        modal_card_layout.addWidget(self.modal_title)
+        modal_card_layout.addWidget(self.modal_body_host, 1)
+        modal_card_layout.addWidget(self.modal_actions_host)
+        modal_overlay_layout.addWidget(self.modal_card)
+
     def _init_player_icons(self, icon_size: int = 18) -> None:
+        transport_color = "#e9e9e9" if self.theme == "dark" else "#232629"
         self.icon_play = self._make_icon("play", icon_size, "#0f0f0f")
         self.icon_pause = self._make_icon("pause", icon_size, "#0f0f0f")
-        self.icon_prev = self._make_icon("prev", icon_size, "#e9e9e9")
-        self.icon_next = self._make_icon("next", icon_size, "#e9e9e9")
+        self.icon_prev = self._make_icon("prev", icon_size, transport_color)
+        self.icon_next = self._make_icon("next", icon_size, transport_color)
 
         self.prev_button.setIcon(self.icon_prev)
         self.prev_button.setIconSize(QSize(icon_size, icon_size))
@@ -930,12 +1217,34 @@ class PlayerWindow(QMainWindow):
         header_wrap = QWidget()
         header_wrap.setLayout(header_row)
 
+        tabs_row = QHBoxLayout()
+        tabs_row.setSpacing(8)
+        self.albums_tab_button = QPushButton("Albums")
+        self.albums_tab_button.setCheckable(True)
+        self.albums_tab_button.setObjectName("TabButton")
+        self.playlists_tab_button = QPushButton("Playlists")
+        self.playlists_tab_button.setCheckable(True)
+        self.playlists_tab_button.setObjectName("TabButton")
+        self.create_playlist_button = QPushButton("Create playlist")
+        self.create_playlist_button.setObjectName("GhostButton")
+        self.delete_playlist_button = QPushButton("Delete playlist")
+        self.delete_playlist_button.setObjectName("GhostButton")
+        self.delete_playlist_button.hide()
+
+        tabs_row.addWidget(self.albums_tab_button)
+        tabs_row.addWidget(self.playlists_tab_button)
+        tabs_row.addStretch(1)
+        tabs_row.addWidget(self.create_playlist_button)
+        tabs_wrap = QWidget()
+        tabs_wrap.setLayout(tabs_row)
+
         self.album_count = QLabel("0 found")
         self.album_count.setObjectName("PanelMeta")
         self.album_search = QLineEdit()
         self.album_search.setPlaceholderText("Search albums")
 
         library_layout.addWidget(header_wrap)
+        library_layout.addWidget(tabs_wrap)
         library_layout.addWidget(self.album_count)
         library_layout.addWidget(self.album_search)
 
@@ -975,12 +1284,28 @@ class PlayerWindow(QMainWindow):
         self.detail_mix_refresh = QPushButton("Pick mix")
         self.detail_mix_refresh.setObjectName("GhostButton")
         self.detail_mix_refresh.setVisible(False)
+        self.detail_playlist_add = QPushButton("Add tracks")
+        self.detail_playlist_add.setObjectName("GhostButton")
+        self.detail_playlist_add.setVisible(False)
+        self.detail_playlist_remove = QPushButton("Remove selected")
+        self.detail_playlist_remove.setObjectName("GhostButton")
+        self.detail_playlist_remove.setVisible(False)
+        self.detail_playlist_delete = QPushButton("Delete playlist")
+        self.detail_playlist_delete.setObjectName("GhostButton")
+        self.detail_playlist_delete.setVisible(False)
+        self.detail_playlist_icon = QPushButton("Change icon")
+        self.detail_playlist_icon.setObjectName("GhostButton")
+        self.detail_playlist_icon.setVisible(False)
 
         text_col = QVBoxLayout()
         text_col.addWidget(self.detail_title)
         text_col.addWidget(self.detail_meta)
         text_col.addWidget(self.detail_play)
         text_col.addWidget(self.detail_mix_refresh)
+        text_col.addWidget(self.detail_playlist_add)
+        text_col.addWidget(self.detail_playlist_remove)
+        text_col.addWidget(self.detail_playlist_delete)
+        text_col.addWidget(self.detail_playlist_icon)
         text_wrap = QWidget()
         text_wrap.setLayout(text_col)
 
@@ -990,11 +1315,27 @@ class PlayerWindow(QMainWindow):
         self.track_search = QLineEdit()
         self.track_search.setPlaceholderText("Search tracks")
 
-        self.reorder_hint = QLabel("Drag tracks to reorder")
+        reorder_row = QHBoxLayout()
+        reorder_row.setSpacing(8)
+        self.reorder_hint = QLabel("Change track number below and save")
         self.reorder_hint.setObjectName("PanelMeta")
+        self.edit_order_button = QPushButton("Edit order")
+        self.edit_order_button.setObjectName("GhostButton")
+        self.edit_order_button.setCheckable(True)
+        self.move_up_button = QPushButton("Up")
+        self.move_up_button.setObjectName("GhostButton")
+        self.move_down_button = QPushButton("Down")
+        self.move_down_button.setObjectName("GhostButton")
+        reorder_row.addWidget(self.reorder_hint, 1)
+        reorder_row.addWidget(self.edit_order_button)
+        reorder_row.addWidget(self.move_up_button)
+        reorder_row.addWidget(self.move_down_button)
+        reorder_wrap = QWidget()
+        reorder_wrap.setLayout(reorder_row)
 
-        self.track_table = TrackTable(0, 4)
-        self.track_table.setHorizontalHeaderLabels(["#", "Title", "Artist", "Length"])
+        self.track_table = TrackTable(0, 5)
+        self.track_table.setHorizontalHeaderLabels(["#", "Title", "Artist", "Length", ""])
+        self.track_table.setProperty("theme_mode", self.theme)
         self.track_table.verticalHeader().setVisible(False)
         self.track_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.track_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1002,19 +1343,22 @@ class PlayerWindow(QMainWindow):
         self.track_table.setObjectName("TrackTable")
         self.track_table.setColumnWidth(0, 40)
         self.track_table.setColumnWidth(3, 70)
+        self.track_table.setColumnWidth(4, 38)
         header = self.track_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
         self.track_table.setShowGrid(False)
         self.track_table.setAlternatingRowColors(False)
         self.track_table.setItemDelegateForColumn(0, TrackNumberDelegate(self.track_table))
-        self.track_table.setDragEnabled(True)
-        self.track_table.setAcceptDrops(True)
-        self.track_table.setDropIndicatorShown(True)
-        self.track_table.setDragDropOverwriteMode(False)
-        self.track_table.setDefaultDropAction(Qt.MoveAction)
+        self.track_table.setItemDelegateForColumn(4, TrackActionDelegate(self.track_table))
+        self.track_table.setDragEnabled(False)
+        self.track_table.setAcceptDrops(False)
+        self.track_table.setDropIndicatorShown(False)
+        self.track_table.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self.track_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 
         self.editor_frame = QFrame()
         self.editor_frame.setObjectName("EditorFrame")
@@ -1043,7 +1387,7 @@ class PlayerWindow(QMainWindow):
         detail_layout.addLayout(back_row)
         detail_layout.addLayout(album_header)
         detail_layout.addWidget(self.track_search)
-        detail_layout.addWidget(self.reorder_hint)
+        detail_layout.addWidget(reorder_wrap)
         detail_layout.addWidget(self.track_table, 1)
         detail_layout.addWidget(self.editor_frame)
 
@@ -1122,13 +1466,24 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.4.3")
+        self.version_label = QLabel("ver 0.5.5")
         self.version_label.setObjectName("SubBrand")
+        self.latest_version_label = QLabel("Latest version here")
+        self.latest_version_label.setObjectName("SubBrand")
+        self.latest_version_link = QLabel('<a href="https://github.com/endercodezz/enderlitplayer">GitHub</a>')
+        self.latest_version_link.setObjectName("SubBrand")
+        self.latest_version_link.setOpenExternalLinks(True)
+        self.latest_version_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.latest_version_link.setCursor(Qt.PointingHandCursor)
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
+        self.latest_version_label.setAlignment(Qt.AlignRight)
+        self.latest_version_link.setAlignment(Qt.AlignRight)
         brand_col.addStretch(1)
         brand_col.addWidget(self.subbrand_label)
         brand_col.addWidget(self.version_label)
+        brand_col.addWidget(self.latest_version_label)
+        brand_col.addWidget(self.latest_version_link)
         brand_wrap = QWidget()
         brand_wrap.setLayout(brand_col)
         volume_wrap = QWidget()
@@ -1143,158 +1498,261 @@ class PlayerWindow(QMainWindow):
         return panel
 
     def _apply_style(self) -> None:
+        if self.theme == "light":
+            colors = {
+                "text": "#1f2937",
+                "window": "#f2f4f8",
+                "panel_bg": "#ffffff",
+                "panel_border": "#d8dee8",
+                "player_bg": "#ffffff",
+                "meta_text": "#6b7280",
+                "sub_text": "#8b95a5",
+                "input_bg": "#f6f8fb",
+                "input_border": "#d7dee8",
+                "input_hover": "#bcc7d6",
+                "btn_bg": "#eef2f7",
+                "btn_border": "#d4dce8",
+                "btn_hover": "#b9c5d6",
+                "tab_bg": "#eef2f7",
+                "tab_border": "#d4dce8",
+                "primary_text": "#ffffff",
+                "ghost_border": "#c8d2e0",
+                "ghost_text": "#334155",
+                "table_bg": "#ffffff",
+                "table_border": "#dbe3ef",
+                "album_item_hover": "#f1f5f9",
+                "album_item_selected": "#eaf3ee",
+                "header_bg": "#f7f9fc",
+                "header_text": "#667085",
+                "table_row_border": "#e6ebf2",
+                "table_hover": "#f2f6fb",
+                "table_selected": "#e8eef6",
+                "cover_bg": "#eef2f7",
+                "editor_bg": "#f8fafc",
+                "slider_bg": "#d7deea",
+                "slider_border": "#ffffff",
+                "loading_bg": "rgba(238, 243, 249, 230)",
+            }
+        else:
+            colors = {
+                "text": "#e9e9e9",
+                "window": "#0f0f0f",
+                "panel_bg": "#121212",
+                "panel_border": "#1a1a1a",
+                "player_bg": "#101010",
+                "meta_text": "#a0a0a0",
+                "sub_text": "#8f8f8f",
+                "input_bg": "#1a1a1a",
+                "input_border": "#2a2a2a",
+                "input_hover": "#303030",
+                "btn_bg": "#1a1a1a",
+                "btn_border": "#2a2a2a",
+                "btn_hover": "#3a3a3a",
+                "tab_bg": "#181818",
+                "tab_border": "#2a2a2a",
+                "primary_text": "#0f0f0f",
+                "ghost_border": "#2e2e2e",
+                "ghost_text": "#cfcfcf",
+                "table_bg": "#131313",
+                "table_border": "#1f1f1f",
+                "album_item_hover": "#1b1b1b",
+                "album_item_selected": "#1f1f1f",
+                "header_bg": "#141414",
+                "header_text": "#b5b5b5",
+                "table_row_border": "#1f1f1f",
+                "table_hover": "#1a1a1a",
+                "table_selected": "#1f1f1f",
+                "cover_bg": "#1a1a1a",
+                "editor_bg": "#111111",
+                "slider_bg": "#2a2a2a",
+                "slider_border": "#0f0f0f",
+                "loading_bg": "rgba(10, 10, 10, 220)",
+            }
         self.setStyleSheet(
-            """
-            QWidget {
+            f"""
+            QWidget {{
               font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
-              color: #e9e9e9;
-            }
-            QMainWindow {
-              background: #0f0f0f;
-            }
-            #Topbar, #Panel {
-              background: #121212;
+              color: {colors["text"]};
+            }}
+            QMainWindow {{
+              background: {colors["window"]};
+            }}
+            #Topbar, #Panel {{
+              background: {colors["panel_bg"]};
               border-radius: 18px;
-              border: 1px solid #1a1a1a;
-            }
-            #PlayerBar {
-              background: #101010;
+              border: 1px solid {colors["panel_border"]};
+            }}
+            #PlayerBar {{
+              background: {colors["player_bg"]};
               border-radius: 18px;
-              border: 1px solid #1a1a1a;
-            }
-            #Brand {
+              border: 1px solid {colors["panel_border"]};
+            }}
+            #Brand {{
               font-weight: 700;
-            }
-            #PanelMeta {
-              color: #a0a0a0;
+            }}
+            #PanelMeta {{
+              color: {colors["meta_text"]};
               font-size: 12px;
-            }
-            #SubBrand {
-              color: #8f8f8f;
+            }}
+            #SubBrand {{
+              color: {colors["sub_text"]};
               font-size: 10px;
-            }
-            #DetailTitle {
+            }}
+            #DetailTitle {{
               font-weight: 700;
-            }
-            QLineEdit {
-              background: #1a1a1a;
-              border: 1px solid #2a2a2a;
+            }}
+            QLineEdit {{
+              background: {colors["input_bg"]};
+              border: 1px solid {colors["input_border"]};
               border-radius: 18px;
               padding: 8px 12px;
-              color: #ffffff;
-            }
-            QLineEdit:hover {
-              border: 1px solid #303030;
-            }
-            QComboBox {
-              background: #1a1a1a;
-              border: 1px solid #2a2a2a;
+              color: {colors["text"]};
+            }}
+            QLineEdit:hover {{
+              border: 1px solid {colors["input_hover"]};
+            }}
+            QComboBox {{
+              background: {colors["input_bg"]};
+              border: 1px solid {colors["input_border"]};
               border-radius: 18px;
               padding: 6px 10px;
-              color: #ffffff;
-            }
-            QComboBox::drop-down {
+              color: {colors["text"]};
+            }}
+            QComboBox::drop-down {{
               border: none;
               width: 18px;
-            }
-            QPushButton {
-              background: #1a1a1a;
-              border: 1px solid #2a2a2a;
+            }}
+            QComboBox QAbstractItemView {{
+              background: {colors["input_bg"]};
+              border: 1px solid {colors["input_border"]};
+              color: {colors["text"]};
+              selection-background-color: {colors["table_selected"]};
+              selection-color: {colors["text"]};
+              outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+              min-height: 24px;
+              padding: 4px 8px;
+            }}
+            QPushButton {{
+              background: {colors["btn_bg"]};
+              border: 1px solid {colors["btn_border"]};
               border-radius: 18px;
               padding: 8px 14px;
               font-weight: 600;
-            }
-            QPushButton:hover {
-              border: 1px solid #3a3a3a;
-            }
-            #PlayerBar QPushButton {
+            }}
+            QPushButton:hover {{
+              border: 1px solid {colors["btn_hover"]};
+            }}
+            #TabButton {{
+              background: {colors["tab_bg"]};
+              border: 1px solid {colors["tab_border"]};
+              border-radius: 14px;
+              padding: 7px 16px;
+              min-width: 110px;
+            }}
+            #TabButton:checked {{
+              background: #1db954;
+              border: none;
+              color: #0f0f0f;
+            }}
+            #PlayerBar QPushButton {{
               font-size: 16px;
               padding: 8px 16px;
               min-width: 44px;
               min-height: 36px;
-            }
-            #PrimaryButton {
+            }}
+            #PrimaryButton {{
               background: #1db954;
-              color: #0f0f0f;
+              color: {colors["primary_text"]};
               border: none;
-            }
-            #PrimaryButton:hover {
+            }}
+            #PrimaryButton:hover {{
               background: #22c95f;
-            }
-            #GhostButton {
+            }}
+            #GhostButton {{
               background: transparent;
-              border: 1px solid #2e2e2e;
-              color: #cfcfcf;
-            }
-            QListWidget, QTableWidget {
+              border: 1px solid {colors["ghost_border"]};
+              color: {colors["ghost_text"]};
+            }}
+            QListWidget, QTableWidget {{
               background: transparent;
               border: none;
-            }
-            #TrackTable {
-              background: #131313;
-              border: 1px solid #1f1f1f;
+            }}
+            #TrackTable {{
+              background: {colors["table_bg"]};
+              border: 1px solid {colors["table_border"]};
               border-radius: 16px;
-            }
-            #AlbumList::item {
+            }}
+            #AlbumList::item {{
               background: transparent;
               border: 1px solid transparent;
               border-radius: 12px;
               padding: 6px;
               margin: 4px;
-            }
-            #AlbumList::item:hover {
-              background: #1b1b1b;
-            }
-            #AlbumList::item:selected {
+            }}
+            #AlbumList::item:hover {{
+              background: {colors["album_item_hover"]};
+            }}
+            #AlbumList::item:selected {{
               border: 1px solid #1db954;
-              background: #1f1f1f;
-            }
-            QHeaderView::section {
-              background: #141414;
-              color: #b5b5b5;
+              background: {colors["album_item_selected"]};
+            }}
+            QHeaderView::section {{
+              background: {colors["header_bg"]};
+              color: {colors["header_text"]};
               padding: 6px;
               border: none;
-              border-bottom: 1px solid #1f1f1f;
-            }
-            QTableWidget::item {
+              border-bottom: 1px solid {colors["table_row_border"]};
+            }}
+            QTableWidget::item {{
               padding: 10px 12px;
-              border-bottom: 1px solid #1f1f1f;
-            }
-            #TrackTable::item:hover {
-              background: #1a1a1a;
-            }
-            #TrackTable::item:selected {
-              background: #1f1f1f;
-            }
-            #CoverLabel {
-              background: #1a1a1a;
+              border-bottom: 1px solid {colors["table_row_border"]};
+            }}
+            #TrackTable::item:hover {{
+              background: {colors["table_hover"]};
+            }}
+            #TrackTable::item:selected {{
+              background: {colors["table_selected"]};
+            }}
+            #CoverLabel {{
+              background: {colors["cover_bg"]};
               border-radius: 10px;
-            }
-            #DetailCover {
-              background: #1a1a1a;
+            }}
+            #DetailCover {{
+              background: {colors["cover_bg"]};
               border-radius: 14px;
-            }
-            #EditorFrame {
-              background: #111111;
+            }}
+            #EditorFrame {{
+              background: {colors["editor_bg"]};
               border-radius: 16px;
-              border: 1px solid #1f1f1f;
-            }
-            QSlider::groove:horizontal {
+              border: 1px solid {colors["table_border"]};
+            }}
+            QSlider::groove:horizontal {{
               height: 5px;
-              background: #2a2a2a;
+              background: {colors["slider_bg"]};
               border-radius: 999px;
-            }
-            QSlider::handle:horizontal {
+            }}
+            QSlider::handle:horizontal {{
               width: 14px;
               background: #1db954;
-              border: 1px solid #0f0f0f;
+              border: 1px solid {colors["slider_border"]};
               border-radius: 7px;
               margin: -5px 0;
-            }
-            #LoadingOverlay {
-              background: rgba(10, 10, 10, 220);
+            }}
+            #LoadingOverlay {{
+              background: {colors["loading_bg"]};
               border-radius: 22px;
-            }
+            }}
+            #ModalOverlay {{
+              background: rgba(0, 0, 0, 120);
+              border-radius: 20px;
+            }}
+            #ModalCard {{
+              background: {colors["panel_bg"]};
+              border-radius: 18px;
+              border: 1px solid {colors["panel_border"]};
+            }}
             """
         )
 
@@ -1302,14 +1760,20 @@ class PlayerWindow(QMainWindow):
         self.scan_button.clicked.connect(self.scan_library)
         self.browse_button.clicked.connect(self.choose_folder)
         self.settings_button.clicked.connect(self.open_settings_dialog)
+        self.albums_tab_button.clicked.connect(lambda: self.set_library_mode("albums"))
+        self.playlists_tab_button.clicked.connect(lambda: self.set_library_mode("playlists"))
+        self.create_playlist_button.clicked.connect(self.create_playlist)
         self.album_list.itemSelectionChanged.connect(self.on_album_selected)
         self.album_list.playAlbumRequested.connect(self.on_album_quick_play)
         self.album_search.textChanged.connect(self.filter_albums)
         self.track_search.textChanged.connect(self.filter_tracks)
         self.track_table.cellDoubleClicked.connect(self.play_selected_track)
         self.track_table.itemSelectionChanged.connect(self.on_track_selected)
-        self.track_table.orderChanged.connect(self.on_track_order_changed)
         self.track_table.playRequested.connect(self.on_track_quick_play)
+        self.track_table.deleteRequested.connect(lambda row: self.remove_selected_from_playlist(row))
+        self.edit_order_button.toggled.connect(self.on_order_edit_toggled)
+        self.move_up_button.clicked.connect(lambda: self.move_selected_track(-1))
+        self.move_down_button.clicked.connect(lambda: self.move_selected_track(1))
         self.play_button.clicked.connect(self.toggle_play)
         self.next_button.clicked.connect(self.play_next)
         self.prev_button.clicked.connect(self.play_prev)
@@ -1318,6 +1782,10 @@ class PlayerWindow(QMainWindow):
         self.back_button.clicked.connect(self.show_library_view)
         self.detail_play.clicked.connect(self.play_album)
         self.detail_mix_refresh.clicked.connect(self.refresh_random_mix)
+        self.detail_playlist_add.clicked.connect(self.add_tracks_to_current_playlist)
+        self.detail_playlist_remove.clicked.connect(lambda: self.remove_selected_from_playlist())
+        self.detail_playlist_delete.clicked.connect(self.delete_selected_playlist)
+        self.detail_playlist_icon.clicked.connect(self.change_current_playlist_icon)
         self.editor_save.clicked.connect(self.save_track_edits)
 
         self.player.positionChanged.connect(self.update_progress)
@@ -1341,6 +1809,21 @@ class PlayerWindow(QMainWindow):
         self.settings.setValue("language", self.language)
         self.apply_language()
 
+    def set_theme(self, theme: str) -> None:
+        if theme not in {"dark", "light"}:
+            return
+        if self.theme == theme:
+            return
+        self.theme = theme
+        self.settings.setValue("theme", self.theme)
+        self._apply_style()
+        self._apply_cover_label_style()
+        self.track_table.setProperty("theme_mode", self.theme)
+        self.track_table.viewport().update()
+        icon_size = max(14, int(16 * max(0.65, min(1.0, self.width() / 1800))))
+        self._init_player_icons(icon_size)
+        self.set_play_state(self.player.playbackState() == QMediaPlayer.PlayingState)
+
     def set_cover_style(self, cover_style: str) -> None:
         if cover_style not in {"rounded", "square"}:
             return
@@ -1356,25 +1839,28 @@ class PlayerWindow(QMainWindow):
     def _apply_cover_label_style(self) -> None:
         now_radius = 10 if self.cover_style == "rounded" else 2
         detail_radius = 14 if self.cover_style == "rounded" else 2
-        self.cover_label.setStyleSheet(f"background: #1a1a1a; border-radius: {now_radius}px;")
-        self.detail_cover.setStyleSheet(f"background: #1a1a1a; border-radius: {detail_radius}px;")
+        background = "#1a1a1a" if self.theme == "dark" else "#eef2f7"
+        self.cover_label.setStyleSheet(f"background: {background}; border-radius: {now_radius}px;")
+        self.detail_cover.setStyleSheet(f"background: {background}; border-radius: {detail_radius}px;")
 
     def open_settings_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Settings" if self.language == "en" else "Настройки")
-        dialog.setModal(True)
-        dialog.setMinimumWidth(360)
-
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
+        content = QWidget(self.modal_body_host)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout(content)
         form.setLabelAlignment(Qt.AlignLeft)
 
-        language_combo = QComboBox(dialog)
+        language_combo = QComboBox(content)
         language_combo.addItem("English", "en")
         language_combo.addItem("Русский", "ru")
         language_combo.setCurrentIndex(0 if self.language == "en" else 1)
 
-        covers_combo = QComboBox(dialog)
+        theme_combo = QComboBox(content)
+        theme_combo.addItem(self.t("theme_dark"), "dark")
+        theme_combo.addItem(self.t("theme_light"), "light")
+        theme_combo.setCurrentIndex(0 if self.theme == "dark" else 1)
+
+        covers_combo = QComboBox(content)
         if self.language == "en":
             covers_combo.addItem("Rounded", "rounded")
             covers_combo.addItem("Square", "square")
@@ -1384,30 +1870,31 @@ class PlayerWindow(QMainWindow):
         covers_combo.setCurrentIndex(0 if self.cover_style == "rounded" else 1)
 
         form.addRow("Language" if self.language == "en" else "Язык", language_combo)
+        form.addRow(self.t("theme"), theme_combo)
         form.addRow("Cover style" if self.language == "en" else "Вид обложек", covers_combo)
         layout.addLayout(form)
 
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        cancel_button = QPushButton("Cancel" if self.language == "en" else "Отмена", dialog)
-        apply_button = QPushButton("Apply" if self.language == "en" else "Применить", dialog)
-        apply_button.setObjectName("PrimaryButton")
-        actions.addWidget(cancel_button)
-        actions.addWidget(apply_button)
-        layout.addLayout(actions)
-
-        cancel_button.clicked.connect(dialog.reject)
-        apply_button.clicked.connect(dialog.accept)
-
-        if dialog.exec() != QDialog.Accepted:
+        action = self.run_inline_modal(
+            self.t("settings"),
+            content,
+            [
+                (self.t("cancel"), "cancel", "GhostButton"),
+                (self.t("apply"), "apply", "PrimaryButton"),
+            ],
+        )
+        if action != "apply":
             return
 
-        self.set_language(language_combo.currentData())
+        selected_language = language_combo.currentData()
+        selected_theme = theme_combo.currentData()
+        self.set_theme(selected_theme)
+        self.set_language(selected_language)
         self.set_cover_style(covers_combo.currentData())
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.loading_overlay.setGeometry(self.centralWidget().rect())
+        self.modal_overlay.setGeometry(self.centralWidget().rect())
         self.update_responsive_layout()
         self.update_album_grid()
         self.update_detail_cover_size()
@@ -1490,13 +1977,127 @@ class PlayerWindow(QMainWindow):
 
     def _handle_forward_nav(self) -> None:
         if self.library_stack.currentIndex() == 0 and self.current_album:
+            if self.current_collection_kind == "playlist" and self.library_mode != "playlists":
+                return
+            if self.current_collection_kind in {"album", "mix"} and self.library_mode != "albums":
+                return
             self.show_album_view()
 
     def show_loading(self, show: bool) -> None:
         self.loading_overlay.setVisible(show)
 
+    def _clear_layout(self, layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def run_inline_modal(
+        self,
+        title: str,
+        body_widget: QWidget,
+        actions: List[tuple[str, str, str]],
+    ) -> str:
+        self.modal_title.setText(title)
+        self._clear_layout(self.modal_body_layout)
+        self._clear_layout(self.modal_actions_layout)
+        self.modal_body_layout.addWidget(body_widget)
+        self.modal_actions_layout.addStretch(1)
+
+        result = {"action": ""}
+        loop = QEventLoop(self)
+
+        def close_with(action_key: str) -> None:
+            result["action"] = action_key
+            self.modal_overlay.hide()
+            loop.quit()
+
+        for text, action_key, object_name in actions:
+            button = QPushButton(text, self.modal_actions_host)
+            if object_name:
+                button.setObjectName(object_name)
+            button.clicked.connect(lambda _checked=False, key=action_key: close_with(key))
+            self.modal_actions_layout.addWidget(button)
+
+        self.modal_card.setMaximumWidth(max(420, int(self.width() * 0.64)))
+        self.modal_card.setMinimumWidth(max(340, int(self.width() * 0.38)))
+        self.modal_card.setMaximumHeight(max(260, int(self.height() * 0.78)))
+        self.modal_overlay.setGeometry(self.centralWidget().rect())
+        self.modal_overlay.show()
+        self.modal_overlay.raise_()
+        loop.exec()
+        return result["action"]
+
+    def show_inline_message(self, title: str, body: str) -> None:
+        content = QWidget(self.modal_body_host)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        message_label = QLabel(body, content)
+        message_label.setWordWrap(True)
+        message_label.setObjectName("PanelMeta")
+        content_layout.addWidget(message_label)
+        self.run_inline_modal(
+            title,
+            content,
+            [(self.t("ok"), "ok", "PrimaryButton")],
+        )
+
+    def ask_inline_confirmation(self, title: str, body: str) -> bool:
+        content = QWidget(self.modal_body_host)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        message_label = QLabel(body, content)
+        message_label.setWordWrap(True)
+        message_label.setObjectName("PanelMeta")
+        content_layout.addWidget(message_label)
+        action = self.run_inline_modal(
+            title,
+            content,
+            [
+                (self.t("no"), "no", "GhostButton"),
+                (self.t("yes"), "yes", "PrimaryButton"),
+            ],
+        )
+        return action == "yes"
+
+    def ask_inline_text(
+        self,
+        title: str,
+        label_text: str,
+        initial_value: str = "",
+    ) -> str:
+        content = QWidget(self.modal_body_host)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(label_text, content)
+        label.setObjectName("PanelMeta")
+        edit = QLineEdit(content)
+        edit.setText(initial_value)
+        content_layout.addWidget(label)
+        content_layout.addWidget(edit)
+        action = self.run_inline_modal(
+            title,
+            content,
+            [
+                (self.t("cancel"), "cancel", "GhostButton"),
+                (self.t("apply"), "apply", "PrimaryButton"),
+            ],
+        )
+        if action != "apply":
+            return ""
+        return edit.text().strip()
+
     def choose_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select Music Folder")
+        folder = self.ask_inline_text(
+            self.t("choose_folder"),
+            self.t("folder_path"),
+            self.path_input.text().strip(),
+        )
         if folder:
             self.path_input.setText(folder)
             self.settings.setValue("library_path", folder)
@@ -1504,7 +2105,7 @@ class PlayerWindow(QMainWindow):
     def scan_library(self) -> None:
         path = self.path_input.text().strip()
         if not path:
-            QMessageBox.warning(self, self.t("missing_folder_title"), self.t("missing_folder_body"))
+            self.show_inline_message(self.t("missing_folder_title"), self.t("missing_folder_body"))
             return
         self.settings.setValue("library_path", path)
 
@@ -1525,13 +2126,14 @@ class PlayerWindow(QMainWindow):
             body = self.t("folder_not_found")
         else:
             body = self.t("scan_failed_body")
-        QMessageBox.warning(self, self.t("scan_failed_title"), body)
+        self.show_inline_message(self.t("scan_failed_title"), body)
 
     def on_scan_finished(self, albums: List[Album]) -> None:
         self.show_loading(False)
         self.albums = albums
         for album in self.albums:
             self.apply_saved_order(album)
+        self.normalize_playlists()
         self.album_search.setText("")
         self.track_search.setText("")
         self.populate_albums()
@@ -1548,38 +2150,95 @@ class PlayerWindow(QMainWindow):
         self.track_filter = self.track_search.text().strip().lower()
         self.populate_tracks()
 
+    def on_order_edit_toggled(self, checked: bool) -> None:
+        self.order_edit_mode = bool(checked)
+        self.edit_order_button.setText(self.t("finish_order") if self.order_edit_mode else self.t("edit_order"))
+        self.populate_tracks()
+
+    def move_selected_track(self, delta: int) -> None:
+        if not self.current_album or not self.order_edit_mode or self.track_filter:
+            return
+        selected_items = self.track_table.selectedItems()
+        if not selected_items:
+            return
+        row = selected_items[0].row()
+        target_row = row + delta
+        if target_row < 0 or target_row >= len(self.current_album.tracks):
+            return
+        tracks = self.current_album.tracks
+        moved = tracks.pop(row)
+        tracks.insert(target_row, moved)
+        self.current_album.tracks = tracks
+
+        if self.current_collection_kind == "playlist" and self.current_playlist:
+            self.current_playlist.track_paths = [track.path for track in tracks]
+            self._save_playlists()
+            if self.playing_album and self.playing_album.id == self.current_playlist.id:
+                self.playing_album = self.build_playlist_album(self.current_playlist)
+        else:
+            for index, track in enumerate(self.current_album.tracks, start=1):
+                track.track_no = index
+            self.track_order_map[self.current_album.id] = [track.path for track in self.current_album.tracks]
+            self._save_track_orders()
+        self.populate_tracks()
+        self.track_table.selectRow(target_row)
+
     def populate_albums(self, preserve_selection: bool = False) -> None:
-        current_id = self.current_album.id if preserve_selection and self.current_album else None
+        current_id = None
+        if preserve_selection and self.current_album:
+            current_id = self.current_album.id
+        elif preserve_selection:
+            current_item = self.album_list.currentItem()
+            if current_item:
+                current_id = current_item.data(Qt.UserRole)
         self.album_list.blockSignals(True)
         self.album_list.clear()
         query = self.album_search.text().strip().lower()
-        filtered = [
-            album
-            for album in self.albums
-            if not query
-            or f"{album.title} {album.artist}".lower().find(query) >= 0
-        ]
-        self.album_count.setText(self.t("found").format(count=len(filtered)))
+        if self.library_mode == "albums":
+            filtered = [
+                album
+                for album in self.albums
+                if not query
+                or f"{album.title} {album.artist}".lower().find(query) >= 0
+            ]
+            self.album_count.setText(self.t("found").format(count=len(filtered)))
 
-        mix_title = self.t("mix_button")
-        mix_hint = self.t("mix_hint")
-        if not query or mix_title.lower().find(query) >= 0 or mix_hint.lower().find(query) >= 0:
-            mix_item = QListWidgetItem()
-            mix_item.setText(f"{mix_title}\n{mix_hint}".strip())
-            cover_size = self.album_list.iconSize().width() or 140
-            mix_item.setIcon(QIcon(rounded_pixmap(build_mix_cover(cover_size), self._cover_radius(cover_size))))
-            mix_item.setData(Qt.UserRole, self.mix_album_id)
-            mix_item.setSizeHint(QSize(160, 200))
-            self.album_list.addItem(mix_item)
+            mix_title = self.t("mix_button")
+            mix_hint = self.t("mix_hint")
+            if not query or mix_title.lower().find(query) >= 0 or mix_hint.lower().find(query) >= 0:
+                mix_item = QListWidgetItem()
+                mix_item.setText(f"{mix_title}\n{mix_hint}".strip())
+                cover_size = self.album_list.iconSize().width() or 140
+                mix_item.setIcon(QIcon(rounded_pixmap(build_mix_cover(cover_size), self._cover_radius(cover_size))))
+                mix_item.setData(Qt.UserRole, self.mix_album_id)
+                mix_item.setSizeHint(QSize(160, 200))
+                self.album_list.addItem(mix_item)
 
-        for album in filtered:
-            item = QListWidgetItem()
-            item.setText(f"{album.title}\n{self.display_artist(album.artist)}".strip())
-            icon = self.album_pixmap(album, 140)
-            item.setIcon(icon)
-            item.setData(Qt.UserRole, album.id)
-            item.setSizeHint(QSize(160, 200))
-            self.album_list.addItem(item)
+            for album in filtered:
+                item = QListWidgetItem()
+                item.setText(f"{album.title}\n{self.display_artist(album.artist)}".strip())
+                icon = self.album_pixmap(album, 140)
+                item.setIcon(icon)
+                item.setData(Qt.UserRole, album.id)
+                item.setSizeHint(QSize(160, 200))
+                self.album_list.addItem(item)
+        else:
+            filtered_playlists = [
+                playlist
+                for playlist in self.playlists
+                if not query or query in playlist.title.lower()
+            ]
+            self.album_count.setText(self.t("found").format(count=len(filtered_playlists)))
+            for playlist in filtered_playlists:
+                playlist_tracks = self.resolve_playlist_tracks(playlist)
+                item = QListWidgetItem()
+                item.setText(
+                    f"{playlist.title}\n{self.t('playlist_card_meta').format(count=len(playlist_tracks))}".strip()
+                )
+                item.setIcon(QIcon(self.playlist_icon_pixmap(playlist, 140)))
+                item.setData(Qt.UserRole, playlist.id)
+                item.setSizeHint(QSize(160, 200))
+                self.album_list.addItem(item)
         if current_id:
             for index in range(self.album_list.count()):
                 item = self.album_list.item(index)
@@ -1587,6 +2246,7 @@ class PlayerWindow(QMainWindow):
                     self.album_list.setCurrentItem(item)
                     break
         self.album_list.blockSignals(False)
+        self._update_library_mode_ui()
         self.update_album_grid()
 
     def _cover_radius(self, size: int) -> float:
@@ -1598,6 +2258,10 @@ class PlayerWindow(QMainWindow):
         radius = self._cover_radius(size)
         if album.id == self.mix_album_id:
             return rounded_pixmap(build_mix_cover(size), radius)
+        if album.id.startswith("playlist_"):
+            playlist = next((pl for pl in self.playlists if pl.id == album.id), None)
+            if playlist:
+                return self.playlist_icon_pixmap(playlist, size)
 
         source = QPixmap()
         if album.cover_bytes:
@@ -1609,11 +2273,91 @@ class PlayerWindow(QMainWindow):
         scaled = source.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         return rounded_pixmap(scaled, radius)
 
+    def all_tracks_by_path(self) -> Dict[str, Track]:
+        tracks: Dict[str, Track] = {}
+        for album in self.albums:
+            for track in album.tracks:
+                tracks[track.path] = track
+        return tracks
+
+    def resolve_playlist_tracks(self, playlist: PlaylistData) -> List[Track]:
+        by_path = self.all_tracks_by_path()
+        resolved: List[Track] = []
+        seen_paths = set()
+        for path in playlist.track_paths:
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            track = by_path.get(path)
+            if track:
+                resolved.append(track)
+        return resolved
+
+    def normalize_playlists(self) -> None:
+        by_path = self.all_tracks_by_path()
+        changed = False
+        for playlist in self.playlists:
+            cleaned_paths = []
+            seen_paths = set()
+            for path in playlist.track_paths:
+                if path in seen_paths or path not in by_path:
+                    changed = True
+                    continue
+                seen_paths.add(path)
+                cleaned_paths.append(path)
+            if cleaned_paths != playlist.track_paths:
+                playlist.track_paths = cleaned_paths
+                changed = True
+        if changed:
+            self._save_playlists()
+
+    def playlist_icon_pixmap(self, playlist: PlaylistData, size: int) -> QPixmap:
+        radius = self._cover_radius(size)
+        source = QPixmap()
+        if playlist.icon_path and Path(playlist.icon_path).exists():
+            source = QPixmap(playlist.icon_path)
+        if source.isNull():
+            playlist_paths = set(playlist.track_paths)
+            for album in self.albums:
+                if not any(track.path in playlist_paths for track in album.tracks):
+                    continue
+                if album.cover_bytes:
+                    source.loadFromData(album.cover_bytes)
+                if source.isNull() and album.cover_path and Path(album.cover_path).exists():
+                    source = QPixmap(album.cover_path)
+                if not source.isNull():
+                    break
+        if source.isNull():
+            source = build_placeholder(playlist.title, size)
+        scaled = source.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        return rounded_pixmap(scaled, radius)
+
+    def build_playlist_album(self, playlist: PlaylistData) -> Album:
+        tracks = self.resolve_playlist_tracks(playlist)
+        duration = sum(track.duration for track in tracks)
+        cover_path = playlist.icon_path if playlist.icon_path and Path(playlist.icon_path).exists() else None
+        return Album(
+            id=playlist.id,
+            title=playlist.title,
+            artist="Various Artists",
+            year="",
+            tracks=tracks,
+            duration=duration,
+            cover_path=cover_path,
+            cover_bytes=None,
+            cover_mime=None,
+        )
+
     def on_album_selected(self) -> None:
         selected_items = self.album_list.selectedItems()
         if not selected_items:
             return
         album_id = selected_items[0].data(Qt.UserRole)
+        if self.library_mode == "playlists":
+            playlist = next((pl for pl in self.playlists if pl.id == album_id), None)
+            if playlist:
+                self.open_playlist(playlist)
+            return
         if album_id == self.mix_album_id:
             mix_album = self.get_random_mix_album()
             if mix_album:
@@ -1628,6 +2372,16 @@ class PlayerWindow(QMainWindow):
         self.on_album_selected()
 
     def on_album_quick_play(self, album_id: str) -> None:
+        if self.library_mode == "playlists":
+            playlist = next((pl for pl in self.playlists if pl.id == album_id), None)
+            if not playlist:
+                return
+            tracks = self.resolve_playlist_tracks(playlist)
+            if not tracks:
+                return
+            self.current_playlist = playlist
+            self.start_track(tracks[0], self.build_playlist_album(playlist))
+            return
         if album_id == self.mix_album_id:
             mix_album = self.get_random_mix_album()
             if mix_album and mix_album.tracks:
@@ -1639,6 +2393,9 @@ class PlayerWindow(QMainWindow):
         self.start_track(album.tracks[0], album)
 
     def open_album(self, album: Album) -> None:
+        self.order_edit_mode = False
+        self.current_collection_kind = "mix" if album.id == self.mix_album_id else "album"
+        self.current_playlist = None
         self.current_album = album
         if album.id == self.mix_album_id:
             self.detail_title.setText(self.t("mix_button"))
@@ -1646,17 +2403,263 @@ class PlayerWindow(QMainWindow):
         else:
             self.detail_title.setText(album.title)
             self.detail_mix_refresh.setVisible(False)
+        self.detail_playlist_add.setVisible(False)
+        self.detail_playlist_remove.setVisible(False)
+        self.detail_playlist_delete.setVisible(False)
+        self.detail_playlist_icon.setVisible(False)
         self.refresh_album_metadata()
         self.track_filter = self.track_search.text().strip().lower()
         self.populate_tracks()
         self.update_cover()
         self.show_album_view()
 
+    def open_playlist(self, playlist: PlaylistData) -> None:
+        self.order_edit_mode = False
+        self.current_collection_kind = "playlist"
+        self.current_playlist = playlist
+        self.current_album = self.build_playlist_album(playlist)
+        self.detail_title.setText(playlist.title)
+        self.detail_mix_refresh.setVisible(False)
+        self.detail_playlist_add.setVisible(True)
+        self.detail_playlist_remove.setVisible(False)
+        self.detail_playlist_delete.setVisible(True)
+        self.detail_playlist_icon.setVisible(True)
+        self.refresh_album_metadata()
+        self.track_filter = self.track_search.text().strip().lower()
+        self.populate_tracks()
+        self.update_cover()
+        self.show_album_view()
+
+    def _select_image_file(self) -> str:
+        file_path = self.ask_inline_text(
+            self.t("choose_icon"),
+            self.t("image_path"),
+        )
+        return file_path or ""
+
+    def create_playlist(self) -> None:
+        content = QWidget(self.modal_body_host)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout(content)
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        name_input = QLineEdit(content)
+        icon_input = QLineEdit(content)
+        icon_input.setReadOnly(True)
+        choose_icon = QPushButton(self.t("choose_icon"), content)
+        choose_icon.setObjectName("GhostButton")
+
+        icon_row = QHBoxLayout()
+        icon_row.addWidget(icon_input, 1)
+        icon_row.addWidget(choose_icon)
+        icon_wrap = QWidget(dialog)
+        icon_wrap.setLayout(icon_row)
+
+        form.addRow(self.t("playlist_name"), name_input)
+        form.addRow(self.t("playlist_icon"), icon_wrap)
+        layout.addLayout(form)
+
+        def on_choose_icon() -> None:
+            icon_path = self._select_image_file()
+            if icon_path:
+                icon_input.setText(icon_path)
+
+        choose_icon.clicked.connect(on_choose_icon)
+        action = self.run_inline_modal(
+            self.t("create_playlist"),
+            content,
+            [
+                (self.t("cancel"), "cancel", "GhostButton"),
+                (self.t("create"), "create", "PrimaryButton"),
+            ],
+        )
+        if action != "create":
+            return
+
+        playlist_name = name_input.text().strip()
+        if not playlist_name:
+            self.show_inline_message(self.t("missing_fields_title"), self.t("playlist_name_required"))
+            return
+
+        icon_path = icon_input.text().strip()
+        playlist_id = f"playlist_{make_id(f'{playlist_name}:{time.time_ns()}')}"
+        playlist = PlaylistData(
+            id=playlist_id,
+            title=playlist_name,
+            icon_path=icon_path,
+            track_paths=[],
+        )
+        self.playlists.append(playlist)
+        self.current_playlist = playlist
+        self._save_playlists()
+        self.set_library_mode("playlists", preserve_selection=False)
+        self.populate_albums()
+        for row in range(self.album_list.count()):
+            item = self.album_list.item(row)
+            if item.data(Qt.UserRole) == playlist.id:
+                self.album_list.setCurrentItem(item)
+                break
+
+    def delete_selected_playlist(self) -> None:
+        playlist_id = self.current_playlist.id if self.current_playlist else None
+        if not playlist_id:
+            selected = self.album_list.currentItem()
+            if selected:
+                playlist_id = selected.data(Qt.UserRole)
+        if not playlist_id:
+            return
+        playlist = next((pl for pl in self.playlists if pl.id == playlist_id), None)
+        if not playlist:
+            return
+        confirmed = self.ask_inline_confirmation(
+            self.t("delete_playlist_title"),
+            self.t("delete_playlist_body").format(name=playlist.title),
+        )
+        if not confirmed:
+            return
+        self.playlists = [pl for pl in self.playlists if pl.id != playlist.id]
+        if self.current_playlist and self.current_playlist.id == playlist.id:
+            self.current_playlist = None
+            if self.current_collection_kind == "playlist":
+                self.current_album = None
+                self.current_collection_kind = "album"
+        if self.playing_album and self.playing_album.id == playlist.id:
+            fallback = self._find_track_by_path(self.current_track.path) if self.current_track else None
+            self.playing_album = fallback[1] if fallback else None
+            self.update_now_playing_cover()
+        self._save_playlists()
+        self.set_library_mode("playlists")
+        self.show_library_view()
+        self.populate_albums()
+
+    def change_current_playlist_icon(self) -> None:
+        if not self.current_playlist:
+            return
+        icon_path = self._select_image_file()
+        if not icon_path:
+            return
+        self.current_playlist.icon_path = icon_path
+        if self.current_album and self.current_album.id == self.current_playlist.id:
+            self.current_album.cover_path = icon_path
+        if self.playing_album and self.playing_album.id == self.current_playlist.id:
+            self.playing_album.cover_path = icon_path
+            self.update_now_playing_cover()
+        self._save_playlists()
+        self.update_cover()
+        self.update_album_list_item(self.current_playlist)
+
+    def add_tracks_to_current_playlist(self) -> None:
+        if not self.current_playlist:
+            return
+        available_tracks: List[tuple[Track, str]] = []
+        for album in self.albums:
+            for track in album.tracks:
+                available_tracks.append((track, album.title))
+        if not available_tracks:
+            self.show_inline_message(self.t("create_playlist"), self.t("no_tracks_to_add"))
+            return
+
+        available_tracks.sort(key=lambda item: (item[0].artist.lower(), item[0].title.lower()))
+        existing_paths = set(self.current_playlist.track_paths)
+
+        content = QWidget(self.modal_body_host)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        content.setMinimumSize(560, 360)
+
+        search_input = QLineEdit(content)
+        search_input.setPlaceholderText(self.t("search_tracks"))
+        track_list = QListWidget(content)
+        track_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        track_list.setAlternatingRowColors(False)
+
+        for track, album_title in available_tracks:
+            item = QListWidgetItem(f"{track.artist} — {track.title}  •  {album_title}")
+            item.setData(Qt.UserRole, track.path)
+            if track.path in existing_paths:
+                item.setForeground(QColor("#7b7b7b"))
+            track_list.addItem(item)
+
+        def on_search_changed() -> None:
+            query = search_input.text().strip().lower()
+            for index in range(track_list.count()):
+                item = track_list.item(index)
+                item.setHidden(bool(query and query not in item.text().lower()))
+
+        search_input.textChanged.connect(on_search_changed)
+
+        layout.addWidget(search_input)
+        layout.addWidget(track_list, 1)
+        action = self.run_inline_modal(
+            self.t("select_tracks_title"),
+            content,
+            [
+                (self.t("cancel"), "cancel", "GhostButton"),
+                (self.t("add_selected"), "add", "PrimaryButton"),
+            ],
+        )
+        if action != "add":
+            return
+
+        selected_paths = []
+        for item in track_list.selectedItems():
+            path = item.data(Qt.UserRole)
+            if not path or path in existing_paths:
+                continue
+            existing_paths.add(path)
+            selected_paths.append(path)
+        if not selected_paths:
+            return
+        self.current_playlist.track_paths.extend(selected_paths)
+        self._save_playlists()
+        self.current_album = self.build_playlist_album(self.current_playlist)
+        if self.playing_album and self.playing_album.id == self.current_playlist.id:
+            self.playing_album = self.build_playlist_album(self.current_playlist)
+        self.refresh_album_metadata()
+        self.populate_tracks()
+        self.update_album_list_item(self.current_playlist)
+
+    def remove_selected_from_playlist(self, row: Optional[int] = None) -> None:
+        if not self.current_playlist or not self.current_album:
+            return
+        if row is None:
+            selected_items = self.track_table.selectedItems()
+            if not selected_items:
+                return
+            row = selected_items[0].row()
+        item = self.track_table.item(row, 0)
+        if not item:
+            return
+        track_id = item.data(Qt.UserRole)
+        track = next((t for t in self.current_album.tracks if t.id == track_id), None)
+        if not track:
+            return
+        removed = False
+        updated_paths = []
+        for path in self.current_playlist.track_paths:
+            if not removed and path == track.path:
+                removed = True
+                continue
+            updated_paths.append(path)
+        if not removed:
+            return
+        self.current_playlist.track_paths = updated_paths
+        self._save_playlists()
+        self.current_album = self.build_playlist_album(self.current_playlist)
+        if self.playing_album and self.playing_album.id == self.current_playlist.id:
+            self.playing_album = self.build_playlist_album(self.current_playlist)
+        self.refresh_album_metadata()
+        self.populate_tracks()
+        self.update_album_list_item(self.current_playlist)
+
     def populate_tracks(self) -> None:
         self.track_table.setRowCount(0)
         if not self.current_album:
             return
         is_mix = self.current_album.id == self.mix_album_id
+        is_playlist = self.current_collection_kind == "playlist"
+        can_reorder = not is_mix and not bool(self.track_filter) and len(self.current_album.tracks) > 1
         tracks = self.current_album.tracks
         if self.track_filter:
             tracks = [
@@ -1664,24 +2667,42 @@ class PlayerWindow(QMainWindow):
                 for track in tracks
                 if self.track_filter in f"{track.title} {track.artist}".lower()
             ]
-            self.track_table.setDragDropMode(QAbstractItemView.NoDragDrop)
             if is_mix:
                 self.reorder_hint.setText(self.t("mix_hint"))
             else:
                 self.reorder_hint.setText(self.t("reorder_hint_filtered"))
         else:
             if is_mix:
-                self.track_table.setDragDropMode(QAbstractItemView.NoDragDrop)
                 self.reorder_hint.setText(self.t("mix_hint"))
             else:
-                self.track_table.setDragDropMode(QAbstractItemView.InternalMove)
                 self.reorder_hint.setText(self.t("reorder_hint"))
 
+        if not can_reorder and self.order_edit_mode:
+            self.order_edit_mode = False
+
+        self.edit_order_button.blockSignals(True)
+        self.edit_order_button.setEnabled(can_reorder)
+        self.edit_order_button.setChecked(self.order_edit_mode)
+        self.edit_order_button.setText(self.t("finish_order") if self.order_edit_mode else self.t("edit_order"))
+        self.edit_order_button.blockSignals(False)
+        self.move_up_button.setVisible(self.order_edit_mode)
+        self.move_down_button.setVisible(self.order_edit_mode)
+        self.move_up_button.setEnabled(False)
+        self.move_down_button.setEnabled(False)
+
         self.editor_frame.setEnabled(not is_mix)
+        self.track_table.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self.track_table.setDragEnabled(False)
+        self.track_table.setAcceptDrops(False)
+        self.track_table.set_playlist_delete_enabled(is_playlist)
+        self.track_table.setColumnHidden(4, not is_playlist)
+        self.detail_playlist_remove.setEnabled(False)
+        self.detail_playlist_delete.setVisible(is_playlist)
 
         self.track_table.setRowCount(len(tracks))
         for row, track in enumerate(tracks):
-            number_item = QTableWidgetItem(str(row + 1 if is_mix else (track.track_no or row + 1)))
+            number_value = row + 1 if is_mix or is_playlist else (track.track_no or row + 1)
+            number_item = QTableWidgetItem(str(number_value))
             title_item = QTableWidgetItem(track.title)
             artist_item = QTableWidgetItem(track.artist)
             length_item = QTableWidgetItem(format_time(track.duration))
@@ -1690,36 +2711,16 @@ class PlayerWindow(QMainWindow):
             self.track_table.setItem(row, 1, title_item)
             self.track_table.setItem(row, 2, artist_item)
             self.track_table.setItem(row, 3, length_item)
+            action_item = QTableWidgetItem("")
+            action_item.setData(Qt.UserRole, track.id)
+            action_item.setTextAlignment(Qt.AlignCenter)
+            action_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.track_table.setItem(row, 4, action_item)
         if self.current_album and self.current_track and self.playing_album == self.current_album:
             self.track_table.set_playing_track(self.current_track.id)
         else:
             self.track_table.set_playing_track(None)
         self.on_track_selected()
-
-    def on_track_order_changed(self) -> None:
-        if not self.current_album:
-            return
-        if self.current_album.id == self.mix_album_id:
-            return
-        if self.track_filter:
-            return
-        new_ids = []
-        for row in range(self.track_table.rowCount()):
-            item = self.track_table.item(row, 0)
-            if item:
-                new_ids.append(item.data(Qt.UserRole))
-        id_to_track = {track.id: track for track in self.current_album.tracks}
-        new_tracks = [id_to_track[track_id] for track_id in new_ids if track_id in id_to_track]
-        existing_ids = {track.id for track in new_tracks}
-        for track in self.current_album.tracks:
-            if track.id not in existing_ids:
-                new_tracks.append(track)
-        self.current_album.tracks = new_tracks
-        for index, track in enumerate(self.current_album.tracks, start=1):
-            track.track_no = index
-        self.track_order_map[self.current_album.id] = [track.path for track in self.current_album.tracks]
-        self._save_track_orders()
-        self.populate_tracks()
 
     def on_track_selected(self) -> None:
         items = self.track_table.selectedItems()
@@ -1729,6 +2730,10 @@ class PlayerWindow(QMainWindow):
             self.editor_title.setText("")
             self.editor_artist.setText("")
             self.editor_filename.setText("")
+            self.move_up_button.setEnabled(False)
+            self.move_down_button.setEnabled(False)
+            if hasattr(self, "detail_playlist_remove"):
+                self.detail_playlist_remove.setEnabled(False)
             return
         row = items[0].row()
         item = self.track_table.item(row, 0)
@@ -1739,10 +2744,22 @@ class PlayerWindow(QMainWindow):
         if not track:
             return
         self.selected_track = track
-        self.editor_number.setText(str(track.track_no) if track.track_no else "")
+        if self.current_collection_kind == "playlist":
+            self.editor_number.setText(str(row + 1))
+        else:
+            self.editor_number.setText(str(track.track_no) if track.track_no else "")
         self.editor_title.setText(track.title)
         self.editor_artist.setText(track.artist)
         self.editor_filename.setText(Path(track.path).name)
+        can_move = self.order_edit_mode and not self.track_filter and self.current_album is not None
+        if can_move:
+            self.move_up_button.setEnabled(row > 0)
+            self.move_down_button.setEnabled(row < len(self.current_album.tracks) - 1)
+        else:
+            self.move_up_button.setEnabled(False)
+            self.move_down_button.setEnabled(False)
+        if hasattr(self, "detail_playlist_remove"):
+            self.detail_playlist_remove.setEnabled(self.current_collection_kind == "playlist")
 
     def update_cover(self) -> None:
         if not self.current_album:
@@ -1844,6 +2861,16 @@ class PlayerWindow(QMainWindow):
         changed = self.library_stack.currentIndex() != 0
         if changed:
             self.library_stack.setCurrentIndex(0)
+        if self.order_edit_mode:
+            self.order_edit_mode = False
+        self.edit_order_button.blockSignals(True)
+        self.edit_order_button.setChecked(False)
+        self.edit_order_button.setText(self.t("edit_order"))
+        self.edit_order_button.blockSignals(False)
+        self.move_up_button.setVisible(False)
+        self.move_down_button.setVisible(False)
+        self.move_up_button.setEnabled(False)
+        self.move_down_button.setEnabled(False)
         self.album_list.clearSelection()
         self.album_list.setCurrentRow(-1)
         self.selected_track = None
@@ -1889,7 +2916,7 @@ class PlayerWindow(QMainWindow):
                 new_number = 0
 
         if not new_title or not new_artist or not new_filename:
-            QMessageBox.warning(self, self.t("missing_fields_title"), self.t("missing_fields_body"))
+            self.show_inline_message(self.t("missing_fields_title"), self.t("missing_fields_body"))
             return
 
         track = self.selected_track
@@ -1899,25 +2926,35 @@ class PlayerWindow(QMainWindow):
         if new_path.suffix == "":
             new_path = new_path.with_suffix(original_path.suffix)
         if new_path.suffix.lower() != original_path.suffix.lower():
-            QMessageBox.warning(self, self.t("invalid_extension_title"), self.t("invalid_extension_body"))
+            self.show_inline_message(self.t("invalid_extension_title"), self.t("invalid_extension_body"))
             return
         if new_path.name != original_path.name:
             candidate = original_path.with_name(new_path.name)
             if candidate.exists():
-                QMessageBox.warning(self, self.t("file_exists_title"), self.t("file_exists_body"))
+                self.show_inline_message(self.t("file_exists_title"), self.t("file_exists_body"))
                 return
             try:
                 original_path.rename(candidate)
             except Exception:
-                QMessageBox.warning(self, self.t("rename_failed_title"), self.t("rename_failed_body"))
+                self.show_inline_message(self.t("rename_failed_title"), self.t("rename_failed_body"))
                 return
             track.path = str(candidate)
-            if self.current_album and self.current_album.id in self.track_order_map:
-                order_list = self.track_order_map[self.current_album.id]
-                self.track_order_map[self.current_album.id] = [
-                    track.path if path == old_path else path for path in order_list
-                ]
+            orders_changed = False
+            for album_id, order_list in list(self.track_order_map.items()):
+                updated = [track.path if path == old_path else path for path in order_list]
+                if updated != order_list:
+                    self.track_order_map[album_id] = updated
+                    orders_changed = True
+            if orders_changed:
                 self._save_track_orders()
+            playlist_changed = False
+            for playlist in self.playlists:
+                updated_paths = [track.path if path == old_path else path for path in playlist.track_paths]
+                if updated_paths != playlist.track_paths:
+                    playlist.track_paths = updated_paths
+                    playlist_changed = True
+            if playlist_changed:
+                self._save_playlists()
 
         try:
             audio = MutagenFile(track.path, easy=True)
@@ -1929,7 +2966,7 @@ class PlayerWindow(QMainWindow):
                 audio["tracknumber"] = [str(new_number)]
             audio.save()
         except Exception:
-            QMessageBox.warning(self, self.t("tag_update_failed_title"), self.t("tag_update_failed_body"))
+            self.show_inline_message(self.t("tag_update_failed_title"), self.t("tag_update_failed_body"))
             return
 
         old_id = track.id
@@ -1950,13 +2987,29 @@ class PlayerWindow(QMainWindow):
 
         self.refresh_album_metadata()
         if new_number > 0 and self.current_album:
-            self.current_album.tracks.sort(
-                key=lambda t: (t.track_no or 9999, t.title.lower())
-            )
-            self.track_order_map[self.current_album.id] = [
-                t.path for t in self.current_album.tracks
-            ]
-            self._save_track_orders()
+            if self.current_collection_kind == "playlist" and self.current_playlist:
+                playlist_tracks = list(self.current_album.tracks)
+                try:
+                    current_index = next(i for i, item in enumerate(playlist_tracks) if item.id == track.id)
+                except StopIteration:
+                    current_index = -1
+                if current_index >= 0:
+                    moved = playlist_tracks.pop(current_index)
+                    target_index = max(0, min(len(playlist_tracks), new_number - 1))
+                    playlist_tracks.insert(target_index, moved)
+                    self.current_album.tracks = playlist_tracks
+                    self.current_playlist.track_paths = [item.path for item in playlist_tracks]
+                    self._save_playlists()
+                    if self.playing_album and self.playing_album.id == self.current_playlist.id:
+                        self.playing_album = self.build_playlist_album(self.current_playlist)
+            else:
+                self.current_album.tracks.sort(
+                    key=lambda t: (t.track_no or 9999, t.title.lower())
+                )
+                self.track_order_map[self.current_album.id] = [
+                    t.path for t in self.current_album.tracks
+                ]
+                self._save_track_orders()
         self.populate_tracks()
         self.update_album_list_item(self.current_album)
 
@@ -1976,6 +3029,15 @@ class PlayerWindow(QMainWindow):
 
     def refresh_album_metadata(self) -> None:
         if not self.current_album:
+            return
+        if self.current_collection_kind == "playlist":
+            total_duration = sum(track.duration for track in self.current_album.tracks)
+            self.detail_meta.setText(
+                self.t("playlist_meta").format(
+                    tracks=len(self.current_album.tracks),
+                    duration=format_time(total_duration),
+                )
+            )
             return
         if self.current_album.id == self.mix_album_id:
             total_duration = sum(track.duration for track in self.current_album.tracks)
@@ -2068,12 +3130,32 @@ class PlayerWindow(QMainWindow):
             if mix_album:
                 self.open_album(mix_album)
 
-    def update_album_list_item(self, album: Optional[Album]) -> None:
-        if not album:
+    def update_album_list_item(self, item_data: Optional[object]) -> None:
+        if not item_data:
+            return
+        item_id = getattr(item_data, "id", None)
+        if not item_id:
             return
         for index in range(self.album_list.count()):
             item = self.album_list.item(index)
-            if item.data(Qt.UserRole) == album.id:
+            if item.data(Qt.UserRole) != item_id:
+                continue
+            if self.library_mode == "playlists":
+                playlist = item_data if isinstance(item_data, PlaylistData) else None
+                if not playlist:
+                    playlist = next((pl for pl in self.playlists if pl.id == item_id), None)
+                if not playlist:
+                    break
+                item.setText(
+                    f"{playlist.title}\n{self.t('playlist_card_meta').format(count=len(self.resolve_playlist_tracks(playlist)))}".strip()
+                )
+                item.setIcon(QIcon(self.playlist_icon_pixmap(playlist, 140)))
+            else:
+                album = item_data if isinstance(item_data, Album) else None
+                if not album:
+                    album = next((al for al in self.albums if al.id == item_id), None)
+                if not album:
+                    break
                 item.setText(f"{album.title}\n{self.display_artist(album.artist)}".strip())
                 break
 
@@ -2187,6 +3269,18 @@ class PlayerWindow(QMainWindow):
             self.editor_layout.setSpacing(int(8 * scale))
         if self.album_list:
             self.album_list.setSpacing(int(10 * scale))
+
+        tab_width = max(92, int(112 * scale))
+        self.albums_tab_button.setMinimumWidth(tab_width)
+        self.playlists_tab_button.setMinimumWidth(tab_width)
+        action_width = max(128, int(154 * scale))
+        self.create_playlist_button.setMinimumWidth(action_width)
+        self.delete_playlist_button.setMinimumWidth(action_width)
+        reorder_btn_width = max(112, int(132 * scale))
+        self.edit_order_button.setMinimumWidth(reorder_btn_width)
+        step_btn_width = max(86, int(94 * scale))
+        self.move_up_button.setMinimumWidth(step_btn_width)
+        self.move_down_button.setMinimumWidth(step_btn_width)
 
         base_font = int(10 + 4 * scale)
         brand_font = int(14 + 6 * scale)

@@ -6,8 +6,10 @@ A modern, minimal desktop music player that scans local folders, groups albums, 
 ### Features
 - Scans a folder for common audio formats (mp3, flac, m4a, aac, ogg, opus, wav)
 - Groups albums by folder, not by artist
+- Library tabs: `Albums` and `Playlists`
+- Playlists: create, set custom icon, add tracks from any album
 - Uses embedded cover art or `cover.jpg` / `folder.jpg`
-- Drag-and-drop track reordering with persistence
+- Track order editing in Edit mode (Up/Down) or by track number, with persistence
 - Click-to-seek progress bar
 - Remembers your music folder and UI language
 - English / Russian UI switch
@@ -28,7 +30,7 @@ A modern, minimal desktop music player that scans local folders, groups albums, 
 - Keyboard: `Space` Play/Pause, `Ctrl+Left/Right` Prev/Next, `Esc` Back
 
 ### Editing metadata
-Open an album, select a track, edit Title / Artist / File name, then Save.
+Open an album or playlist, select a track, edit Title / Artist / File name, then Save.
 
 ---
 
@@ -38,8 +40,10 @@ Open an album, select a track, edit Title / Artist / File name, then Save.
 ### Возможности
 - Сканирует папку с форматами mp3, flac, m4a, aac, ogg, opus, wav
 - Группирует альбомы по папке, а не по исполнителю
+- В медиатеке есть вкладки `Альбомы` и `Плейлисты`
+- Плейлисты: создание, своя иконка, добавление треков из любых альбомов
 - Берет обложки из тегов или из `cover.jpg` / `folder.jpg`
-- Перетаскивание треков для изменения порядка (сохранится)
+- Изменение порядка треков в режиме редактирования (Вверх/Вниз) или через номер трека (сохранится)
 - Переход по клику на прогресс-баре
 - Запоминает путь до музыки и язык интерфейса
 - Переключение English / Russian
@@ -60,4 +64,4 @@ Open an album, select a track, edit Title / Artist / File name, then Save.
 - Клавиатура: `Space` Пауза/Плей, `Ctrl+Left/Right` Пред/След, `Esc` Назад
 
 ### Редактирование тегов
-Откройте альбом, выберите трек, измените Название / Автор / Имя файла, затем Сохранить.
+Откройте альбом или плейлист, выберите трек, измените Название / Автор / Имя файла, затем Сохранить.
