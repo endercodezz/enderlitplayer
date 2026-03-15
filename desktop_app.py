@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 import math
+import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -421,6 +422,9 @@ TRANSLATIONS = {
         "browse": "Browse",
         "scan": "Scan Library",
         "albums": "Albums",
+        "mix_button": "Random mix",
+        "mix_hint": "Updates on request",
+        "mix_refresh": "Pick mix",
         "found": "{count} found",
         "back_to_albums": "Back to albums",
         "play": "Play",
@@ -469,6 +473,9 @@ TRANSLATIONS = {
         "browse": "Обзор",
         "scan": "Сканировать",
         "albums": "Альбомы",
+        "mix_button": "Случайный микс",
+        "mix_hint": "Обновляется по кнопке",
+        "mix_refresh": "Подобрать",
         "found": "Найдено: {count}",
         "back_to_albums": "Назад к альбомам",
         "play": "Слушать",
@@ -545,6 +552,8 @@ class PlayerWindow(QMainWindow):
         self.audio_output.setVolume(self.volume_value / 100.0)
 
         self._nav_last = {"back": 0.0, "forward": 0.0}
+        self.mix_album_id = "mix_random"
+        self.mix_track_paths, self.mix_updated_at = self._load_mix_state()
 
         self._build_ui()
         self._apply_style()
@@ -608,6 +617,39 @@ class PlayerWindow(QMainWindow):
             value = 80
         return max(0, min(100, value))
 
+    def _load_mix_state(self) -> tuple[list[str], float]:
+        raw = self.settings.value("mix_tracks", "")
+        updated_raw = self.settings.value("mix_updated_at", 0)
+        try:
+            updated = float(updated_raw)
+        except Exception:
+            updated = 0.0
+        if isinstance(raw, list):
+            return [str(item) for item in raw], updated
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except Exception:
+                raw = ""
+        if not isinstance(raw, str):
+            raw = str(raw)
+        if not raw:
+            return [], updated
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(item) for item in data], updated
+        except Exception:
+            pass
+        return [], updated
+
+    def _save_mix_state(self) -> None:
+        try:
+            self.settings.setValue("mix_tracks", json.dumps(self.mix_track_paths))
+            self.settings.setValue("mix_updated_at", float(self.mix_updated_at))
+        except Exception:
+            pass
+
     def _save_track_orders(self) -> None:
         try:
             self.settings.setValue("track_orders", json.dumps(self.track_order_map))
@@ -626,6 +668,9 @@ class PlayerWindow(QMainWindow):
         self.path_input.setPlaceholderText(self.t("choose_folder"))
         self.browse_button.setText(self.t("browse"))
         self.scan_button.setText(self.t("scan"))
+        self.album_header_label.setText(self.t("albums"))
+        self.mix_button.setText(self.t("mix_button"))
+        self.mix_refresh.setText(self.t("mix_refresh"))
         self.album_search.setPlaceholderText(self.t("search_albums"))
         self.back_button.setText(self.t("back_to_albums"))
         self.detail_play.setText(self.t("play"))
@@ -651,6 +696,8 @@ class PlayerWindow(QMainWindow):
         if not self.current_album:
             self.detail_title.setText(self.t("album_default"))
         if self.current_album:
+            if self.current_album.id == self.mix_album_id:
+                self.detail_title.setText(self.t("mix_button"))
             self.refresh_album_metadata()
 
     def _build_ui(self) -> None:
@@ -799,14 +846,26 @@ class PlayerWindow(QMainWindow):
         library_layout.setContentsMargins(0, 0, 0, 0)
         library_layout.setSpacing(12)
 
-        header = QLabel("Albums")
-        header.setObjectName("PanelTitle")
+        header_row = QHBoxLayout()
+        self.album_header_label = QLabel("Albums")
+        self.album_header_label.setObjectName("PanelTitle")
+        self.mix_button = QPushButton("Random mix")
+        self.mix_button.setObjectName("GhostButton")
+        self.mix_refresh = QPushButton("Pick mix")
+        self.mix_refresh.setObjectName("GhostButton")
+        header_row.addWidget(self.album_header_label)
+        header_row.addStretch(1)
+        header_row.addWidget(self.mix_button)
+        header_row.addWidget(self.mix_refresh)
+        header_wrap = QWidget()
+        header_wrap.setLayout(header_row)
+
         self.album_count = QLabel("0 found")
         self.album_count.setObjectName("PanelMeta")
         self.album_search = QLineEdit()
         self.album_search.setPlaceholderText("Search albums")
 
-        library_layout.addWidget(header)
+        library_layout.addWidget(header_wrap)
         library_layout.addWidget(self.album_count)
         library_layout.addWidget(self.album_search)
 
@@ -988,7 +1047,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.2.2")
+        self.version_label = QLabel("ver 0.3.3")
         self.version_label.setObjectName("SubBrand")
         self.subbrand_label.setAlignment(Qt.AlignRight)
         self.version_label.setAlignment(Qt.AlignRight)
@@ -1163,6 +1222,8 @@ class PlayerWindow(QMainWindow):
         self.album_list.itemSelectionChanged.connect(self.on_album_selected)
         self.album_list.playAlbumRequested.connect(self.on_album_quick_play)
         self.album_search.textChanged.connect(self.filter_albums)
+        self.mix_button.clicked.connect(self.show_random_mix)
+        self.mix_refresh.clicked.connect(self.refresh_random_mix)
         self.track_search.textChanged.connect(self.filter_tracks)
         self.track_table.cellDoubleClicked.connect(self.play_selected_track)
         self.track_table.itemSelectionChanged.connect(self.on_track_selected)
@@ -1375,15 +1436,10 @@ class PlayerWindow(QMainWindow):
         if not selected_items:
             return
         album_id = selected_items[0].data(Qt.UserRole)
-        self.current_album = next((a for a in self.albums if a.id == album_id), None)
-        if not self.current_album:
+        album = next((a for a in self.albums if a.id == album_id), None)
+        if not album:
             return
-        self.detail_title.setText(self.current_album.title)
-        self.refresh_album_metadata()
-        self.track_filter = self.track_search.text().strip().lower()
-        self.populate_tracks()
-        self.update_cover()
-        self.show_album_view()
+        self.open_album(album)
 
     def on_album_clicked(self, _item: QListWidgetItem) -> None:
         self.on_album_selected()
@@ -1394,10 +1450,23 @@ class PlayerWindow(QMainWindow):
             return
         self.start_track(album.tracks[0], album)
 
+    def open_album(self, album: Album) -> None:
+        self.current_album = album
+        if album.id == self.mix_album_id:
+            self.detail_title.setText(self.t("mix_button"))
+        else:
+            self.detail_title.setText(album.title)
+        self.refresh_album_metadata()
+        self.track_filter = self.track_search.text().strip().lower()
+        self.populate_tracks()
+        self.update_cover()
+        self.show_album_view()
+
     def populate_tracks(self) -> None:
         self.track_table.setRowCount(0)
         if not self.current_album:
             return
+        is_mix = self.current_album.id == self.mix_album_id
         tracks = self.current_album.tracks
         if self.track_filter:
             tracks = [
@@ -1406,14 +1475,23 @@ class PlayerWindow(QMainWindow):
                 if self.track_filter in f"{track.title} {track.artist}".lower()
             ]
             self.track_table.setDragDropMode(QAbstractItemView.NoDragDrop)
-            self.reorder_hint.setText(self.t("reorder_hint_filtered"))
+            if is_mix:
+                self.reorder_hint.setText(self.t("mix_hint"))
+            else:
+                self.reorder_hint.setText(self.t("reorder_hint_filtered"))
         else:
-            self.track_table.setDragDropMode(QAbstractItemView.InternalMove)
-            self.reorder_hint.setText(self.t("reorder_hint"))
+            if is_mix:
+                self.track_table.setDragDropMode(QAbstractItemView.NoDragDrop)
+                self.reorder_hint.setText(self.t("mix_hint"))
+            else:
+                self.track_table.setDragDropMode(QAbstractItemView.InternalMove)
+                self.reorder_hint.setText(self.t("reorder_hint"))
+
+        self.editor_frame.setEnabled(not is_mix)
 
         self.track_table.setRowCount(len(tracks))
         for row, track in enumerate(tracks):
-            number_item = QTableWidgetItem(str(track.track_no or row + 1))
+            number_item = QTableWidgetItem(str(row + 1 if is_mix else (track.track_no or row + 1)))
             title_item = QTableWidgetItem(track.title)
             artist_item = QTableWidgetItem(track.artist)
             length_item = QTableWidgetItem(format_time(track.duration))
@@ -1430,6 +1508,8 @@ class PlayerWindow(QMainWindow):
 
     def on_track_order_changed(self) -> None:
         if not self.current_album:
+            return
+        if self.current_album.id == self.mix_album_id:
             return
         if self.track_filter:
             return
@@ -1536,6 +1616,8 @@ class PlayerWindow(QMainWindow):
         next_index = index + 1
         if next_index < len(tracks):
             self.start_track(tracks[next_index], self.playing_album)
+            return
+        self.start_random_album_after_end()
 
     def play_prev(self) -> None:
         if not self.playing_album or not self.current_track:
@@ -1551,6 +1633,18 @@ class PlayerWindow(QMainWindow):
         prev_index = max(0, index - 1)
         self.start_track(tracks[prev_index], self.playing_album)
 
+    def start_random_album_after_end(self) -> None:
+        candidates = [album for album in self.albums if album.tracks]
+        if not candidates:
+            return
+        exclude_id = self.playing_album.id if self.playing_album else None
+        if exclude_id:
+            candidates = [album for album in candidates if album.id != exclude_id]
+        if not candidates:
+            return
+        album = random.choice(candidates)
+        self.start_track(album.tracks[0], album)
+
     def show_album_view(self) -> None:
         if self.library_stack.currentIndex() != 1:
             self.library_stack.setCurrentIndex(1)
@@ -1563,6 +1657,7 @@ class PlayerWindow(QMainWindow):
         self.album_list.clearSelection()
         self.album_list.setCurrentRow(-1)
         self.selected_track = None
+        self.editor_frame.setEnabled(True)
         self.editor_number.setText("")
         self.editor_title.setText("")
         self.editor_artist.setText("")
@@ -1692,6 +1787,16 @@ class PlayerWindow(QMainWindow):
     def refresh_album_metadata(self) -> None:
         if not self.current_album:
             return
+        if self.current_album.id == self.mix_album_id:
+            total_duration = sum(track.duration for track in self.current_album.tracks)
+            self.detail_meta.setText(
+                self.t("album_meta").format(
+                    artist=self.t("various_artists"),
+                    tracks=len(self.current_album.tracks),
+                    duration=format_time(total_duration),
+                )
+            )
+            return
         artists = {track.artist for track in self.current_album.tracks if track.artist}
         if len(artists) == 1:
             self.current_album.artist = next(iter(artists))
@@ -1713,6 +1818,65 @@ class PlayerWindow(QMainWindow):
         if artist == "Various Artists":
             return self.t("various_artists")
         return artist
+
+    def _build_random_mix(self) -> None:
+        path_to_track: dict[str, Track] = {}
+        for album in self.albums:
+            for track in album.tracks:
+                path_to_track[track.path] = track
+        all_paths = list(path_to_track.keys())
+        random.shuffle(all_paths)
+        selected_paths = all_paths[: min(20, len(all_paths))]
+        self.mix_track_paths = selected_paths
+        self.mix_updated_at = time.time()
+        self._save_mix_state()
+
+    def _resolve_mix_tracks(self) -> list[Track]:
+        path_to_track: dict[str, Track] = {}
+        for album in self.albums:
+            for track in album.tracks:
+                path_to_track[track.path] = track
+        resolved = [path_to_track[path] for path in self.mix_track_paths if path in path_to_track]
+        return resolved
+
+    def get_random_mix_album(self, force: bool = False) -> Optional[Album]:
+        if not self.albums:
+            return None
+        if force or not self.mix_track_paths:
+            self._build_random_mix()
+        tracks = self._resolve_mix_tracks()
+        if len(tracks) != len(self.mix_track_paths):
+            self._build_random_mix()
+            tracks = self._resolve_mix_tracks()
+        if not tracks:
+            return None
+        duration = sum(track.duration for track in tracks)
+        return Album(
+            id=self.mix_album_id,
+            title=self.t("mix_button"),
+            artist="Various Artists",
+            year="",
+            tracks=tracks,
+            duration=duration,
+            cover_path=None,
+            cover_bytes=None,
+            cover_mime=None,
+        )
+
+    def show_random_mix(self) -> None:
+        mix_album = self.get_random_mix_album()
+        if not mix_album:
+            return
+        self.open_album(mix_album)
+
+    def refresh_random_mix(self) -> None:
+        if not self.albums:
+            return
+        self._build_random_mix()
+        if self.current_album and self.current_album.id == self.mix_album_id:
+            mix_album = self.get_random_mix_album()
+            if mix_album:
+                self.open_album(mix_album)
 
     def update_album_list_item(self, album: Optional[Album]) -> None:
         if not album:
