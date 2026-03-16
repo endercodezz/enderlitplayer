@@ -30,6 +30,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -745,6 +746,8 @@ class PlayerWindow(QMainWindow):
         self.audio_output.setVolume(self.volume_value / 100.0)
 
         self._nav_last = {"back": 0.0, "forward": 0.0}
+        self._modal_close_callback = None
+        self._modal_escape_action = "cancel"
         self._transport_buttons: tuple[QPushButton, ...] = tuple()
         self._transport_button_effects: dict[QPushButton, QGraphicsOpacityEffect] = {}
         self._transport_button_anims: dict[QPushButton, QPropertyAnimation] = {}
@@ -1466,7 +1469,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.5.7")
+        self.version_label = QLabel("ver 0.5.9")
         self.version_label.setObjectName("SubBrand")
         self.latest_version_label = QLabel("Latest version here")
         self.latest_version_label.setObjectName("SubBrand")
@@ -1933,6 +1936,12 @@ class PlayerWindow(QMainWindow):
                     self._handle_forward_nav()
                 return True
         if event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Escape:
+                if self.modal_overlay.isVisible() and self._modal_close_callback:
+                    self._modal_close_callback(self._modal_escape_action)
+                else:
+                    self.show_library_view()
+                return True
             if isinstance(self.focusWidget(), QLineEdit):
                 return False
             if event.key() == Qt.Key_Space:
@@ -1968,9 +1977,6 @@ class PlayerWindow(QMainWindow):
                 if self.library_stack.currentIndex() == 1 and self.selected_track:
                     self.save_track_edits()
                     return True
-            if event.key() == Qt.Key_Escape:
-                self.show_library_view()
-                return True
             if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_Left:
                 self.play_prev()
                 return True
@@ -2029,9 +2035,20 @@ class PlayerWindow(QMainWindow):
         loop = QEventLoop(self)
 
         def close_with(action_key: str) -> None:
+            if result["action"]:
+                return
             result["action"] = action_key
             self.modal_overlay.hide()
+            self._modal_close_callback = None
+            self._modal_escape_action = "cancel"
             loop.quit()
+
+        fallback_action = actions[0][1] if actions else "cancel"
+        self._modal_escape_action = next(
+            (action_key for _text, action_key, _name in actions if action_key in {"cancel", "no", "ok"}),
+            fallback_action,
+        )
+        self._modal_close_callback = close_with
 
         for text, action_key, object_name in actions:
             button = QPushButton(text, self.modal_actions_host)
@@ -2047,6 +2064,8 @@ class PlayerWindow(QMainWindow):
         self.modal_overlay.show()
         self.modal_overlay.raise_()
         loop.exec()
+        self._modal_close_callback = None
+        self._modal_escape_action = "cancel"
         return result["action"]
 
     def show_inline_message(self, title: str, body: str) -> None:
@@ -2109,11 +2128,9 @@ class PlayerWindow(QMainWindow):
         return edit.text().strip()
 
     def choose_folder(self) -> None:
-        folder = self.ask_inline_text(
-            self.t("choose_folder"),
-            self.t("folder_path"),
-            self.path_input.text().strip(),
-        )
+        current_path = self.path_input.text().strip()
+        start_dir = current_path if current_path and Path(current_path).exists() else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, self.t("choose_folder"), start_dir)
         if folder:
             self.path_input.setText(folder)
             self.settings.setValue("library_path", folder)
@@ -2450,9 +2467,20 @@ class PlayerWindow(QMainWindow):
         self.show_album_view()
 
     def _select_image_file(self) -> str:
-        file_path = self.ask_inline_text(
+        current_icon = ""
+        if self.current_playlist:
+            current_icon = self.current_playlist.icon_path or ""
+        start_dir = str(Path.home())
+        if current_icon and Path(current_icon).exists():
+            start_dir = str(Path(current_icon).parent)
+        elif self.path_input.text().strip() and Path(self.path_input.text().strip()).exists():
+            start_dir = self.path_input.text().strip()
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
             self.t("choose_icon"),
-            self.t("image_path"),
+            start_dir,
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All files (*)",
         )
         return file_path or ""
 
@@ -3232,14 +3260,10 @@ class PlayerWindow(QMainWindow):
         self.update_now_playing_cover()
         self.player.setSource(QUrl.fromLocalFile(track.path))
         self._restore_position_ms = max(0, self._last_position_ms)
-        self._restore_autoplay = self._last_playing
-        self._restore_pending = True
-        if self._restore_position_ms == 0 and self._restore_autoplay:
-            self.player.play()
-            self.set_play_state(True)
-        else:
-            self.player.pause()
-            self.set_play_state(False)
+        self._restore_autoplay = False
+        self._restore_pending = self._restore_position_ms > 0
+        self.player.pause()
+        self.set_play_state(False)
 
     def update_album_grid(self) -> None:
         if not self.album_list:
