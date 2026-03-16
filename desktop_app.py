@@ -1466,7 +1466,7 @@ class PlayerWindow(QMainWindow):
         brand_col = QVBoxLayout()
         self.subbrand_label = QLabel("Enderlit Player by Enderlit")
         self.subbrand_label.setObjectName("SubBrand")
-        self.version_label = QLabel("ver 0.5.5")
+        self.version_label = QLabel("ver 0.5.7")
         self.version_label.setObjectName("SubBrand")
         self.latest_version_label = QLabel("Latest version here")
         self.latest_version_label.setObjectName("SubBrand")
@@ -1739,6 +1739,22 @@ class PlayerWindow(QMainWindow):
               border: 1px solid {colors["slider_border"]};
               border-radius: 7px;
               margin: -5px 0;
+            }}
+            #Progress::sub-page:horizontal {{
+              background: #1db954;
+              border-radius: 999px;
+            }}
+            #Progress::add-page:horizontal {{
+              background: {colors["slider_bg"]};
+              border-radius: 999px;
+            }}
+            #Volume::sub-page:horizontal {{
+              background: #1db954;
+              border-radius: 999px;
+            }}
+            #Volume::add-page:horizontal {{
+              background: {colors["slider_bg"]};
+              border-radius: 999px;
             }}
             #LoadingOverlay {{
               background: {colors["loading_bg"]};
@@ -2110,7 +2126,7 @@ class PlayerWindow(QMainWindow):
         self.settings.setValue("library_path", path)
 
         self.show_loading(True)
-        self.scan_thread = QThread()
+        self.scan_thread = QThread(self)
         self.scan_worker = ScanWorker(path)
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
@@ -2118,6 +2134,9 @@ class PlayerWindow(QMainWindow):
         self.scan_worker.failed.connect(self.on_scan_failed)
         self.scan_worker.finished.connect(self.scan_thread.quit)
         self.scan_worker.failed.connect(self.scan_thread.quit)
+        self.scan_worker.finished.connect(self.scan_worker.deleteLater)
+        self.scan_worker.failed.connect(self.scan_worker.deleteLater)
+        self.scan_thread.finished.connect(self.scan_thread.deleteLater)
         self.scan_thread.start()
 
     def on_scan_failed(self, message: str) -> None:
@@ -2453,7 +2472,7 @@ class PlayerWindow(QMainWindow):
         icon_row = QHBoxLayout()
         icon_row.addWidget(icon_input, 1)
         icon_row.addWidget(choose_icon)
-        icon_wrap = QWidget(dialog)
+        icon_wrap = QWidget(content)
         icon_wrap.setLayout(icon_row)
 
         form.addRow(self.t("playlist_name"), name_input)
@@ -2804,6 +2823,8 @@ class PlayerWindow(QMainWindow):
         self._schedule_playback_save(immediate=True)
 
     def toggle_play(self) -> None:
+        if not self.current_track:
+            return
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
             self.set_play_state(False)
@@ -3157,6 +3178,7 @@ class PlayerWindow(QMainWindow):
                 if not album:
                     break
                 item.setText(f"{album.title}\n{self.display_artist(album.artist)}".strip())
+                item.setIcon(QIcon(self.album_pixmap(album, 140)))
                 break
 
     def update_volume(self, value: int) -> None:
@@ -3210,7 +3232,7 @@ class PlayerWindow(QMainWindow):
         self.update_now_playing_cover()
         self.player.setSource(QUrl.fromLocalFile(track.path))
         self._restore_position_ms = max(0, self._last_position_ms)
-        self._restore_autoplay = False
+        self._restore_autoplay = self._last_playing
         self._restore_pending = True
         if self._restore_position_ms == 0 and self._restore_autoplay:
             self.player.play()
