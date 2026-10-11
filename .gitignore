@@ -1,8 +1,47 @@
-.venv/
+# Temporary workspace
+.tmp/
+
+# Python
 __pycache__/
-*.pyc
-.idea/
-music/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Build artifacts
 build/
+dist/
 *.spec
 icon.ico
+
+# Claude Code
+.claude/
+.claude.json
+.claude.json.*
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.claudeignore
+
+# Other AI tool artifacts
+.codex/
+.aider*
+.cursor/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment and logs
+.env
+.env.*
+*.log
+*.tmp
+
+# Local music used for manual testing
+music/
