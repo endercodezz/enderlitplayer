@@ -155,7 +155,8 @@ def package(bundle: Path) -> tuple[Path, Path]:
                 zf.write(path, Path(NAME) / path.relative_to(bundle))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     sums = DIST / "SHA256SUMS.txt"
-    sums.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    # LF line endings so `sha256sum --check` works with every coreutils version.
+    sums.write_bytes(f"{digest}  {archive.name}\n".encode())
     print(f"{archive.name}: {archive.stat().st_size / 1_048_576:.1f} MiB, sha256 {digest}", flush=True)
     return archive, sums
 
