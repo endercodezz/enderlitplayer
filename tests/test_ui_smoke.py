@@ -208,3 +208,31 @@ def test_edit_through_window_updates_views(application: Application) -> None:
     application.library.edit_track(track, TrackEdit("Edited Title", track.artist, Path(track.path).name), album)
     assert window.player_bar.title.full_text() == "Edited Title"
     assert window.collection_page.panel.track_at(0).title == "Edited Title"
+
+
+def test_mouse_interactions(application: Application, qapp: QApplication) -> None:
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    from enderlitplayer.ui.widgets.album_grid import play_rect
+
+    window = application.window
+    window.navigate("albums")
+    qapp.processEvents()
+    grid = window.albums_page.grid
+    first = grid.grid_model.item(0)
+    rect = grid.visualRect(grid.grid_model.index(0))
+    QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=play_rect(rect).center().toPoint())
+    assert application.controller.collection is not None
+    assert application.controller.collection.id == first.id
+    assert window.current_page == "albums"  # the play button does not navigate
+
+    QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=rect.center() - QPoint(0, rect.height() // 4))
+    assert window.current_page == "collection"
+
+    view = window.collection_page.panel.view
+    row_rect = view.visualRect(view.track_model.index(1))
+    QTest.mouseClick(
+        view.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(row_rect.left() + 20, row_rect.center().y())
+    )
+    assert application.controller.track is view.track_model.row(1).track

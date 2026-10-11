@@ -133,6 +133,7 @@ def probe_duration_ffprobe(path: Path) -> float | None:
                 str(path),
             ],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             check=False,
             timeout=10,

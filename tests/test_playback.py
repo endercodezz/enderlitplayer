@@ -6,6 +6,7 @@ import random
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QCoreApplication
 
 from audio_fixtures import write_wav
 from enderlitplayer.audio.backend import MediaBackend
@@ -177,6 +178,9 @@ def test_backend_error_skips(store: SettingsStore, albums: list[Album]) -> None:
     ctl, backend = controller(store, albums)
     ctl.play_collection(albums[0])
     backend.errorOccurred.emit("decoder failure")
+    # A trailing error for the same broken source must not skip a second track.
+    backend.errorOccurred.emit("invalid media")
+    QCoreApplication.processEvents()
     assert ctl.track is albums[0].tracks[1]
 
 
@@ -202,3 +206,19 @@ def test_update_collection_keeps_track(store: SettingsStore, albums: list[Album]
     assert ctl.track is one.tracks[0]
     ctl.next()  # track 0 is now last in the reordered album -> random other album
     assert ctl.collection is albums[1]
+
+
+def test_qt_backend_reports_one_error_per_source(qapp: object) -> None:
+    from PySide6.QtMultimedia import QMediaPlayer
+
+    from enderlitplayer.audio.backend import QtMediaBackend
+
+    backend = QtMediaBackend()
+    errors: list[str] = []
+    backend.errorOccurred.connect(errors.append)
+    backend._on_error(QMediaPlayer.Error.FormatError, "bad file")
+    backend._on_status(QMediaPlayer.MediaStatus.InvalidMedia)
+    assert errors == ["bad file"]
+    backend._error_reported = False  # what set_source() does for the next track
+    backend._on_status(QMediaPlayer.MediaStatus.InvalidMedia)
+    assert len(errors) == 2

@@ -298,8 +298,11 @@ class PlaybackController(QObject):
             self._set_playing(False)
 
     def _on_error(self, message: str) -> None:
-        log.warning("Cannot play %s: %s", self.track.path if self.track else "?", message)
-        self._handle_failure()
+        failed = self.track
+        log.warning("Cannot play %s: %s", failed.path if failed else "?", message)
+        # Defer the skip: the backend may still deliver trailing signals for the broken
+        # source in this call chain, and they must not be attributed to the next track.
+        QTimer.singleShot(0, lambda: self._handle_failure() if self.track is failed else None)
 
     def _handle_failure(self) -> None:
         failed = self.track

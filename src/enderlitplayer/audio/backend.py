@@ -60,6 +60,7 @@ class QtMediaBackend(MediaBackend):
         self._player = QMediaPlayer(self)
         self._output = QAudioOutput(self)
         self._player.setAudioOutput(self._output)
+        self._error_reported = False
         # QMediaPlayer emits qint64; re-emit as Python ints.
         self._player.positionChanged.connect(lambda value: self.positionChanged.emit(int(value)))
         self._player.durationChanged.connect(lambda value: self.durationChanged.emit(int(value)))
@@ -76,17 +77,27 @@ class QtMediaBackend(MediaBackend):
         elif status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
             self.mediaLoaded.emit()
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
-            self.errorOccurred.emit(self._player.errorString() or "invalid media")
+            self._report_error(self._player.errorString() or "invalid media")
 
     def _on_error(self, error: QMediaPlayer.Error, message: str) -> None:
         if error != QMediaPlayer.Error.NoError:
-            log.warning("Playback error: %s", message)
-            self.errorOccurred.emit(message)
+            self._report_error(message)
+
+    def _report_error(self, message: str) -> None:
+        # QMediaPlayer signals a broken file both as an error and as InvalidMedia;
+        # report it once per source so the controller skips exactly one track.
+        if self._error_reported:
+            return
+        self._error_reported = True
+        log.warning("Playback error: %s", message)
+        self.errorOccurred.emit(message)
 
     def set_source(self, path: str) -> None:
+        self._error_reported = False
         self._player.setSource(QUrl.fromLocalFile(path))
 
     def clear_source(self) -> None:
+        self._error_reported = False
         self._player.stop()
         self._player.setSource(QUrl())
 
