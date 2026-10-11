@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enderlitplayer"
+dynamic = ["version"]
+description = "A desktop music player for local libraries, built with PySide6."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Enderlit" }]
+keywords = ["music", "player", "audio", "pyside6", "desktop"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+dependencies = [
+    "PySide6>=6.6,<6.11",
+    "mutagen>=1.47,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "build>=1.2",
+]
+build = [
+    "pyinstaller>=6.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/endercodezz/enderlitplayer"
+Releases = "https://github.com/endercodezz/enderlitplayer/releases"
+
+[project.gui-scripts]
+enderlitplayer = "enderlitplayer.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "enderlitplayer.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = [
+    "RUF001",  # typographic characters in UI strings are intentional
+    "RUF012",
+    "N802",    # Qt overrides use camelCase
+    "N815",
+    "SIM105",
+    "SIM102",
+    "SIM108",
+    "N818",
+    "RUF002",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["enderlitplayer"]
